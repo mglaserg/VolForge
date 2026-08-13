@@ -1,0 +1,28 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "volforge"
+version = "0.1.0"
+description = "SVI volatility surface calibration and relative-value research"
+requires-python = ">=3.10"
+dependencies = [
+    "numpy>=1.24",
+    "scipy>=1.10",
+    "pandas>=2.0",
+]
+
+[project.optional-dependencies]
+data = ["pyarrow>=14", "duckdb>=0.10"]
+viz = ["matplotlib>=3.7", "plotly>=5.18"]
+dev = ["pytest>=7.4", "ruff>=0.4", "jupyter"]
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/volforge"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+
+[tool.ruff]
+line-length = 100

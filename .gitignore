@@ -1,0 +1,17 @@
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+*.egg-info/
+dist/
+build/
+.pytest_cache/
+.ruff_cache/
+.ipynb_checkpoints/
+.DS_Store
+.env
+
+# Market data snapshots: large, regenerable-only-going-forward, and
+# potentially licence-restricted. Back these up outside git.
+data/
+*.parquet
