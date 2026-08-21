@@ -1,0 +1,1 @@
+python .\snapshot.py --symbols SPY NVDA IWM LULU

@@ -25,6 +25,9 @@ __all__ = [
     "plot_pca_scores",
     "plot_pca_residual_heatmap",
     "plot_signal_buckets",
+    "plot_ssvi_diagnostics",
+    "plot_essvi_diagnostics",
+    "plot_fengler_diagnostics",
 ]
 
 
@@ -275,3 +278,239 @@ def plot_signal_buckets(buckets: pd.DataFrame, ax=None):
     ax.set_title("convergence by signal bucket, net of costs")
     ax.grid(alpha=0.25, axis="y")
     return ax
+
+
+def plot_ssvi_diagnostics(slices_and_fits, ssvi_fit, figsize=(12, 8), k_grid=None):
+    """Four-panel view of a global SSVI fit against independent raw-SVI slices.
+
+    Panels: ATM theta clock (raw vs monotone repair), per-expiry SSVI IV RMSE,
+    raw-SVI minus SSVI total-variance disagreement, and SSVI no-arbitrage
+    margins.  The disagreement heatmap is the useful research panel: it shows
+    which independently fitted maturity wants to depart from the globally
+    coupled SSVI term structure.
+    """
+    plt = _mpl()
+    from .svi import svi_total_variance
+    from .ssvi import ssvi_butterfly_conditions, ssvi_calendar_ratio
+
+    pairs = [(s, f) for s, f in slices_and_fits
+             if s.T in set(np.round(ssvi_fit.T_obs, 12)) or f.is_reliable]
+    # Match to the T values actually used by SSVI.
+    pairs = [(s, f) for s, f in pairs
+             if np.min(np.abs(ssvi_fit.T_obs - s.T)) < 1e-10]
+    pairs.sort(key=lambda sf: sf[0].T)
+    if not pairs:
+        raise ValueError("none of the supplied slices were used by the SSVI fit")
+
+    if k_grid is None:
+        lo = max(-0.30, min(float(np.min(s.k)) for s, _ in pairs))
+        hi = min(0.25, max(float(np.max(s.k)) for s, _ in pairs))
+        k_grid = np.linspace(lo, hi, 41)
+    k_grid = np.asarray(k_grid, float)
+
+    fig, axes = plt.subplots(2, 2, figsize=figsize)
+
+    # ATM total-variance clock.
+    ax = axes[0, 0]
+    c = ssvi_fit.theta_curve
+    dtes = c.t_years * 365.25
+    ax.plot(dtes, c.raw_theta, "o--", lw=1.0, label="raw SVI ATM theta")
+    ax.plot(dtes, c.theta, "o-", lw=1.8, label="monotone theta")
+    ax.set_xlabel("DTE")
+    ax.set_ylabel("ATM total variance")
+    ax.set_title(f"ATM variance clock · repair={c.repair_fraction:.2%}")
+    ax.legend(frameon=False, fontsize=8)
+    ax.grid(alpha=0.25)
+
+    # Per-slice SSVI fit error.
+    ax = axes[0, 1]
+    ds = np.array(sorted(ssvi_fit.slice_rmse_iv))
+    vals = np.array([ssvi_fit.slice_rmse_iv[d] * 100 for d in ds])
+    ax.bar(np.arange(len(ds)), vals)
+    ax.set_xticks(np.arange(len(ds)))
+    ax.set_xticklabels([f"{d:.0f}d" for d in ds], rotation=45, ha="right")
+    ax.set_ylabel("RMSE (vol points)")
+    ax.set_title(f"SSVI slice error · global={ssvi_fit.rmse_iv*100:.2f}vp")
+    ax.grid(alpha=0.25, axis="y")
+
+    # Independent raw SVI minus global SSVI.
+    ax = axes[1, 0]
+    M = []
+    tenors = []
+    for s, f in pairs:
+        theta = float(ssvi_fit.theta(s.T))
+        raw = svi_total_variance(k_grid, f.params)
+        coupled = ssvi_fit.total_variance(k_grid, s.T)
+        M.append(raw - coupled)
+        tenors.append(s.dte)
+    plot_surface_heatmap(np.asarray(M), tenors, k_grid, ax=ax,
+                         title="raw SVI − SSVI", cbar_label="total variance")
+
+    # No-arbitrage margins across the observed ATM variance term structure.
+    ax = axes[1, 1]
+    theta = c.theta
+    c1, c2 = ssvi_butterfly_conditions(theta, ssvi_fit.params)
+    cr = ssvi_calendar_ratio(theta, ssvi_fit.params)
+    ax.plot(dtes, c1, "o-", label="theta phi (1+|rho|)  < 4")
+    ax.plot(dtes, c2, "o-", label="theta phi² (1+|rho|) <= 4")
+    ax.plot(dtes, cr, "o-", label="calendar ratio")
+    ax.axhline(4.0, color="0.4", lw=1, ls="--")
+    if np.isfinite(ssvi_fit.calendar_ratio_upper) and ssvi_fit.calendar_ratio_upper <= 4.5:
+        ax.axhline(ssvi_fit.calendar_ratio_upper, color="0.65", lw=1, ls=":")
+    ax.set_xlabel("DTE")
+    ax.set_title(f"no-arbitrage checks · butterfly={ssvi_fit.butterfly_free} · "
+                 f"calendar={ssvi_fit.calendar_free}")
+    ax.legend(frameon=False, fontsize=7)
+    ax.grid(alpha=0.25)
+
+    fig.suptitle(
+        f"SSVI rho={ssvi_fit.params.rho:+.3f}  eta={ssvi_fit.params.eta:.3f}  "
+        f"gamma={ssvi_fit.params.gamma:.3f}", y=0.995
+    )
+    fig.tight_layout(rect=[0, 0, 1, 0.96])
+    return fig
+
+
+
+def plot_essvi_diagnostics(slices_and_fits, essvi_fit, figsize=(12, 8), k_grid=None):
+    """Four-panel eSSVI view: theta, rho(theta), raw-SVI disagreement, no-arb margins."""
+    plt = _mpl()
+    from .svi import svi_total_variance
+    from .essvi import essvi_rho, essvi_phi, essvi_calendar_terms, essvi_butterfly_conditions
+
+    pairs = [(s, f) for s, f in slices_and_fits
+             if np.min(np.abs(essvi_fit.T_obs - s.T)) < 1e-10]
+    pairs.sort(key=lambda sf: sf[0].T)
+    if not pairs:
+        raise ValueError("none of the supplied slices were used by the eSSVI fit")
+
+    if k_grid is None:
+        lo = max(-0.30, min(float(np.min(s.k)) for s, _ in pairs))
+        hi = min(0.25, max(float(np.max(s.k)) for s, _ in pairs))
+        k_grid = np.linspace(lo, hi, 41)
+    k_grid = np.asarray(k_grid, float)
+
+    fig, axes = plt.subplots(2, 2, figsize=figsize)
+    c = essvi_fit.theta_curve
+    dtes = c.t_years * 365.25
+
+    ax = axes[0, 0]
+    ax.plot(dtes, c.raw_theta, "o--", lw=1.0, label="raw SVI ATM theta")
+    ax.plot(dtes, c.theta, "o-", lw=1.8, label="monotone theta")
+    ax.set_xlabel("DTE")
+    ax.set_ylabel("ATM total variance")
+    ax.set_title(f"ATM variance clock · repair={c.repair_fraction:.2%}")
+    ax.legend(frameon=False, fontsize=8)
+    ax.grid(alpha=0.25)
+
+    ax = axes[0, 1]
+    theta_dense = np.linspace(max(c.theta.min(), 1e-8), c.theta.max(), 200)
+    dte_dense = np.interp(theta_dense, c.theta, dtes)
+    rho = essvi_rho(theta_dense, essvi_fit.params)
+    phi = essvi_phi(theta_dense, essvi_fit.params)
+    ax.plot(dte_dense, rho, lw=1.8, label="rho(theta)")
+    ax.set_xlabel("DTE")
+    ax.set_ylabel("rho")
+    ax2 = ax.twinx()
+    ax2.plot(dte_dense, phi, lw=1.2, ls="--", label="phi(theta)")
+    ax2.set_ylabel("phi")
+    ax.set_title("eSSVI maturity-dependent correlation")
+    lines = ax.get_lines() + ax2.get_lines()
+    ax.legend(lines, [l.get_label() for l in lines], frameon=False, fontsize=8)
+    ax.grid(alpha=0.25)
+
+    ax = axes[1, 0]
+    M, tenors = [], []
+    for slc, raw_fit in pairs:
+        raw = svi_total_variance(k_grid, raw_fit.params)
+        coupled = essvi_fit.total_variance(k_grid, slc.T)
+        M.append(raw - coupled)
+        tenors.append(slc.dte)
+    plot_surface_heatmap(np.asarray(M), tenors, k_grid, ax=ax,
+                         title="raw SVI − eSSVI", cbar_label="total variance")
+
+    ax = axes[1, 1]
+    gamma, delta, lhs, margin = essvi_calendar_terms(theta_dense, essvi_fit.params)
+    c1, c2 = essvi_butterfly_conditions(theta_dense, essvi_fit.params)
+    ax.plot(dte_dense, margin, lw=1.6, label="calendar margin")
+    ax.plot(dte_dense, 4.0 - c1, lw=1.2, label="butterfly margin 1")
+    ax.plot(dte_dense, 4.0 - c2, lw=1.2, label="butterfly margin 2")
+    ax.axhline(0, color="0.4", lw=1, ls="--")
+    ax.set_xlabel("DTE")
+    ax.set_title(f"no-arbitrage margins · butterfly={essvi_fit.butterfly_free} · "
+                 f"calendar={essvi_fit.calendar_free}")
+    ax.legend(frameon=False, fontsize=7)
+    ax.grid(alpha=0.25)
+
+    p = essvi_fit.params
+    fig.suptitle(
+        f"eSSVI rho0={p.rho0:+.3f}  rho_m={p.rho_m:+.3f}  a={p.a:.3f}  "
+        f"eta={p.eta:.3f}  gamma={p.gamma:.3f}", y=0.995
+    )
+    fig.tight_layout(rect=[0, 0, 1, 0.96])
+    return fig
+
+
+def plot_fengler_diagnostics(fengler_fit, figsize=(12, 8)):
+    """Diagnostics for the nonparametric Fengler surface."""
+    plt = _mpl()
+    from .blackscholes import implied_vol_vec
+
+    fits = sorted(fengler_fit.slices, key=lambda f: f.T)
+    fig, axes = plt.subplots(2, 2, figsize=figsize)
+
+    # Market and fitted smiles for representative short/middle/long slices.
+    ax = axes[0, 0]
+    picks = sorted(set([0, len(fits) // 2, len(fits) - 1]))
+    for idx in picks:
+        f = fits[idx]
+        x = f.knots
+        market_iv = implied_vol_vec(f.market_values, 1.0, x, f.T,
+                                    np.ones(len(x), dtype=bool), 1.0)
+        fit_iv = implied_vol_vec(f.values, 1.0, x, f.T,
+                                 np.ones(len(x), dtype=bool), 1.0)
+        k = np.log(x)
+        ax.plot(k, market_iv * 100, "o", ms=2.5, alpha=0.6)
+        ax.plot(k, fit_iv * 100, lw=1.5, label=f"{f.dte:.0f}d")
+    ax.set_xlabel("log-moneyness k")
+    ax.set_ylabel("implied vol (%)")
+    ax.set_title("Fengler constrained spline slices")
+    ax.legend(frameon=False, fontsize=8)
+    ax.grid(alpha=0.25)
+
+    ax = axes[0, 1]
+    dtes = np.array([f.dte for f in fits])
+    rmse = np.array([f.rmse_iv * 100 for f in fits])
+    ax.bar(np.arange(len(fits)), rmse)
+    ax.set_xticks(np.arange(len(fits)))
+    ax.set_xticklabels([f"{d:.0f}d" for d in dtes], rotation=45, ha="right")
+    ax.set_ylabel("RMSE (vol points)")
+    ax.set_title(f"slice error · global={fengler_fit.rmse_iv*100:.2f}vp")
+    ax.grid(alpha=0.25, axis="y")
+
+    ax = axes[1, 0]
+    ax.plot(dtes, [f.min_gamma for f in fits], "o-", label="min second derivative")
+    ax.plot(dtes, [f.left_slope + 1.0 for f in fits], "o-", label="left slope + 1")
+    ax.plot(dtes, [-f.right_slope for f in fits], "o-", label="-right slope")
+    ax.axhline(0, color="0.4", lw=1, ls="--")
+    ax.set_xlabel("DTE")
+    ax.set_title(f"strike-arbitrage margins · free={fengler_fit.butterfly_free}")
+    ax.legend(frameon=False, fontsize=7)
+    ax.grid(alpha=0.25)
+
+    ax = axes[1, 1]
+    margins = [f.calendar_margin_min if np.isfinite(f.calendar_margin_min) else np.nan
+               for f in fits]
+    ax.plot(dtes, margins, "o-")
+    ax.axhline(0, color="0.4", lw=1, ls="--")
+    ax.set_xlabel("DTE")
+    ax.set_ylabel("longer call − shorter call")
+    ax.set_title(f"calendar no-crossing · free={fengler_fit.calendar_free}")
+    ax.grid(alpha=0.25)
+
+    fig.suptitle(
+        f"Fengler surface · lambda={fengler_fit.smoothing_lambda:g} · "
+        f"reliable={fengler_fit.is_reliable}", y=0.995
+    )
+    fig.tight_layout(rect=[0, 0, 1, 0.96])
+    return fig

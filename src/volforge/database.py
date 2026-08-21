@@ -9,11 +9,15 @@ will quietly corrupt every downstream average you compute.
 
 Tables
 ------
-svi_parameters   one row per (symbol, trade_date, expiry)
-surface_grid     one row per (symbol, trade_date, tenor_days, k) -- the fixed grid
-features         one row per (symbol, trade_date)
-pca_scores       one row per (symbol, trade_date, model_id, component)
-pca_models       one row per fitted PCA, with loadings stored as JSON
+svi_parameters         one row per (symbol, trade_date, expiry)
+ssvi_parameters        one global coupled-surface fit per (symbol, trade_date)
+essvi_parameters       one extended-SSVI fit per (symbol, trade_date)
+fengler_runs           one nonparametric Fengler surface run per (symbol, trade_date)
+surface_grid           legacy raw-SVI fixed grid (kept for backward compatibility)
+modeled_surface_grid   model-tagged fixed grid for SVI/SSVI/eSSVI/Fengler comparisons
+features               one row per (symbol, trade_date)
+pca_scores             one row per (symbol, trade_date, model_id, component)
+pca_models             one row per fitted PCA, with loadings stored as JSON
 """
 
 from __future__ import annotations
@@ -62,6 +66,93 @@ CREATE TABLE IF NOT EXISTS svi_parameters (
 
 CREATE INDEX IF NOT EXISTS ix_svi_symbol_date ON svi_parameters (symbol, trade_date);
 
+CREATE TABLE IF NOT EXISTS ssvi_parameters (
+    symbol                    TEXT NOT NULL,
+    trade_date                TEXT NOT NULL,
+    rho                       REAL,
+    eta                       REAL,
+    gamma                     REAL,
+    phi_form                  TEXT,
+    rmse                      REAL,
+    rmse_iv                   REAL,
+    max_abs_err_iv            REAL,
+    n_obs                     INTEGER,
+    n_slices                  INTEGER,
+    n_theta_slices            INTEGER,
+    success                   INTEGER,
+    butterfly_free            INTEGER,
+    calendar_free             INTEGER,
+    min_durrleman_g           REAL,
+    max_bfly_condition1       REAL,
+    max_bfly_condition2       REAL,
+    calendar_ratio_min        REAL,
+    calendar_ratio_max        REAL,
+    calendar_ratio_upper      REAL,
+    theta_repair              REAL,
+    theta_repair_fraction     REAL,
+    theta_curve               TEXT,
+    slice_rmse_iv             TEXT,
+    created_at                TEXT DEFAULT CURRENT_TIMESTAMP,
+    PRIMARY KEY (symbol, trade_date)
+);
+
+CREATE INDEX IF NOT EXISTS ix_ssvi_symbol_date ON ssvi_parameters (symbol, trade_date);
+
+CREATE TABLE IF NOT EXISTS essvi_parameters (
+    symbol                    TEXT NOT NULL,
+    trade_date                TEXT NOT NULL,
+    rho0                      REAL,
+    rho_m                     REAL,
+    a                         REAL,
+    eta                       REAL,
+    gamma                     REAL,
+    theta_max                 REAL,
+    phi_form                  TEXT,
+    rmse                      REAL,
+    rmse_iv                   REAL,
+    max_abs_err_iv            REAL,
+    n_obs                     INTEGER,
+    n_slices                  INTEGER,
+    n_theta_slices            INTEGER,
+    success                   INTEGER,
+    butterfly_free            INTEGER,
+    calendar_free             INTEGER,
+    min_durrleman_g           REAL,
+    max_bfly_condition1       REAL,
+    max_bfly_condition2       REAL,
+    calendar_margin_min       REAL,
+    calendar_lhs_max          REAL,
+    calendar_gamma_min        REAL,
+    calendar_gamma_max        REAL,
+    theta_repair              REAL,
+    theta_repair_fraction     REAL,
+    theta_curve               TEXT,
+    slice_rmse_iv             TEXT,
+    created_at                TEXT DEFAULT CURRENT_TIMESTAMP,
+    PRIMARY KEY (symbol, trade_date)
+);
+
+CREATE INDEX IF NOT EXISTS ix_essvi_symbol_date ON essvi_parameters (symbol, trade_date);
+
+CREATE TABLE IF NOT EXISTS fengler_runs (
+    symbol                    TEXT NOT NULL,
+    trade_date                TEXT NOT NULL,
+    smoothing_lambda          REAL,
+    success                   INTEGER,
+    butterfly_free            INTEGER,
+    calendar_free             INTEGER,
+    rmse_iv                   REAL,
+    max_abs_err_iv            REAL,
+    n_obs                     INTEGER,
+    n_slices                  INTEGER,
+    calendar_margin_min       REAL,
+    slice_diagnostics         TEXT,
+    created_at                TEXT DEFAULT CURRENT_TIMESTAMP,
+    PRIMARY KEY (symbol, trade_date)
+);
+
+CREATE INDEX IF NOT EXISTS ix_fengler_symbol_date ON fengler_runs (symbol, trade_date);
+
 CREATE TABLE IF NOT EXISTS surface_grid (
     symbol        TEXT NOT NULL,
     trade_date    TEXT NOT NULL,
@@ -74,6 +165,24 @@ CREATE TABLE IF NOT EXISTS surface_grid (
 );
 
 CREATE INDEX IF NOT EXISTS ix_surf_symbol_date ON surface_grid (symbol, trade_date);
+
+-- Model-aware grid.  The legacy surface_grid table remains the raw-SVI fixed
+-- grid for backward compatibility; this table lets SVI/SSVI/eSSVI/Fengler
+-- coexist without overwriting each other.
+CREATE TABLE IF NOT EXISTS modeled_surface_grid (
+    symbol        TEXT NOT NULL,
+    trade_date    TEXT NOT NULL,
+    model         TEXT NOT NULL,
+    tenor_days    REAL NOT NULL,
+    k             REAL NOT NULL,
+    total_var     REAL,
+    iv            REAL,
+    extrapolated  INTEGER,
+    PRIMARY KEY (symbol, trade_date, model, tenor_days, k)
+);
+
+CREATE INDEX IF NOT EXISTS ix_model_surf_symbol_date
+ON modeled_surface_grid (symbol, trade_date, model);
 
 CREATE TABLE IF NOT EXISTS features (
     symbol      TEXT NOT NULL,
@@ -177,6 +286,128 @@ class VolDB:
         with self.connect() as con:
             return pd.read_sql_query(q, con, params=args)
 
+    # ----------------------------------------------------------------- SSVI
+    def save_ssvi_fit(self, symbol, trade_date, fit):
+        """Upsert one global SSVI calibration for a trade date."""
+        row = fit.as_row()
+        payload = {
+            "symbol": symbol,
+            "trade_date": _d(trade_date),
+            "rho": row["rho"],
+            "eta": row["eta"],
+            "gamma": row["gamma"],
+            "phi_form": row["phi_form"],
+            "rmse": row["rmse"],
+            "rmse_iv": row["rmse_iv"],
+            "max_abs_err_iv": row["max_abs_err_iv"],
+            "n_obs": row["n_obs"],
+            "n_slices": row["n_slices"],
+            "n_theta_slices": row["n_theta_slices"],
+            "success": int(row["success"]),
+            "butterfly_free": int(row["butterfly_free"]),
+            "calendar_free": int(row["calendar_free"]),
+            "min_durrleman_g": row["min_durrleman_g"],
+            "max_bfly_condition1": row["max_bfly_condition1"],
+            "max_bfly_condition2": row["max_bfly_condition2"],
+            "calendar_ratio_min": row["calendar_ratio_min"],
+            "calendar_ratio_max": row["calendar_ratio_max"],
+            "calendar_ratio_upper": row["calendar_ratio_upper"],
+            "theta_repair": row["theta_repair"],
+            "theta_repair_fraction": row["theta_repair_fraction"],
+            "theta_curve": json.dumps(fit.theta_curve.to_dict()),
+            "slice_rmse_iv": json.dumps({str(k): float(v) for k, v in fit.slice_rmse_iv.items()}),
+        }
+        self._upsert("ssvi_parameters", [payload])
+        return payload
+
+    def load_ssvi_fits(self, symbol, trade_date=None) -> pd.DataFrame:
+        q = "SELECT * FROM ssvi_parameters WHERE symbol = ?"
+        args = [symbol]
+        if trade_date is not None:
+            q += " AND trade_date = ?"
+            args.append(_d(trade_date))
+        q += " ORDER BY trade_date"
+        with self.connect() as con:
+            return pd.read_sql_query(q, con, params=args)
+
+    # ---------------------------------------------------------------- eSSVI
+    def save_essvi_fit(self, symbol, trade_date, fit):
+        """Upsert one global eSSVI calibration for a trade date."""
+        row = fit.as_row()
+        payload = {
+            "symbol": symbol,
+            "trade_date": _d(trade_date),
+            "rho0": row["rho0"],
+            "rho_m": row["rho_m"],
+            "a": row["a"],
+            "eta": row["eta"],
+            "gamma": row["gamma"],
+            "theta_max": row["theta_max"],
+            "phi_form": row["phi_form"],
+            "rmse": row["rmse"],
+            "rmse_iv": row["rmse_iv"],
+            "max_abs_err_iv": row["max_abs_err_iv"],
+            "n_obs": row["n_obs"],
+            "n_slices": row["n_slices"],
+            "n_theta_slices": row["n_theta_slices"],
+            "success": int(row["success"]),
+            "butterfly_free": int(row["butterfly_free"]),
+            "calendar_free": int(row["calendar_free"]),
+            "min_durrleman_g": row["min_durrleman_g"],
+            "max_bfly_condition1": row["max_bfly_condition1"],
+            "max_bfly_condition2": row["max_bfly_condition2"],
+            "calendar_margin_min": row["calendar_margin_min"],
+            "calendar_lhs_max": row["calendar_lhs_max"],
+            "calendar_gamma_min": row["calendar_gamma_min"],
+            "calendar_gamma_max": row["calendar_gamma_max"],
+            "theta_repair": row["theta_repair"],
+            "theta_repair_fraction": row["theta_repair_fraction"],
+            "theta_curve": json.dumps(fit.theta_curve.to_dict()),
+            "slice_rmse_iv": json.dumps({str(k): float(v) for k, v in fit.slice_rmse_iv.items()}),
+        }
+        self._upsert("essvi_parameters", [payload])
+        return payload
+
+    def load_essvi_fits(self, symbol, trade_date=None) -> pd.DataFrame:
+        q = "SELECT * FROM essvi_parameters WHERE symbol = ?"
+        args = [symbol]
+        if trade_date is not None:
+            q += " AND trade_date = ?"
+            args.append(_d(trade_date))
+        q += " ORDER BY trade_date"
+        with self.connect() as con:
+            return pd.read_sql_query(q, con, params=args)
+
+    # -------------------------------------------------------------- Fengler
+    def save_fengler_fit(self, symbol, trade_date, fit):
+        row = fit.as_row()
+        payload = {
+            "symbol": symbol,
+            "trade_date": _d(trade_date),
+            "smoothing_lambda": row["smoothing_lambda"],
+            "success": int(row["success"]),
+            "butterfly_free": int(row["butterfly_free"]),
+            "calendar_free": int(row["calendar_free"]),
+            "rmse_iv": row["rmse_iv"],
+            "max_abs_err_iv": row["max_abs_err_iv"],
+            "n_obs": row["n_obs"],
+            "n_slices": row["n_slices"],
+            "calendar_margin_min": row["calendar_margin_min"],
+            "slice_diagnostics": json.dumps([s.as_dict() for s in fit.slices]),
+        }
+        self._upsert("fengler_runs", [payload])
+        return payload
+
+    def load_fengler_fits(self, symbol, trade_date=None) -> pd.DataFrame:
+        q = "SELECT * FROM fengler_runs WHERE symbol = ?"
+        args = [symbol]
+        if trade_date is not None:
+            q += " AND trade_date = ?"
+            args.append(_d(trade_date))
+        q += " ORDER BY trade_date"
+        with self.connect() as con:
+            return pd.read_sql_query(q, con, params=args)
+
     # -------------------------------------------------------------- surfaces
     def save_surface(self, symbol, trade_date, surface):
         """Persist a Surface object onto the fixed grid."""
@@ -194,6 +425,39 @@ class VolDB:
                 })
         self._upsert("surface_grid", rows)
         return len(rows)
+
+    def save_model_surface(self, symbol, trade_date, model, surface):
+        """Persist any model on the common grid without overwriting other models."""
+        rows = []
+        model = str(model).lower()
+        for i, tenor in enumerate(surface.tenor_days):
+            for j, k in enumerate(surface.k_grid):
+                rows.append({
+                    "symbol": symbol,
+                    "trade_date": _d(trade_date),
+                    "model": model,
+                    "tenor_days": float(tenor),
+                    "k": float(k),
+                    "total_var": float(surface.total_var[i, j]),
+                    "iv": float(surface.iv[i, j]),
+                    "extrapolated": int(surface.extrapolated[i]),
+                })
+        self._upsert("modeled_surface_grid", rows)
+        return len(rows)
+
+    def load_model_surface_panel(self, symbol, model) -> pd.DataFrame:
+        """Wide total-variance panel for one named surface model."""
+        with self.connect() as con:
+            df = pd.read_sql_query(
+                "SELECT trade_date, tenor_days, k, total_var FROM modeled_surface_grid "
+                "WHERE symbol = ? AND model = ? ORDER BY trade_date",
+                con, params=[symbol, str(model).lower()])
+        if df.empty:
+            return df
+        panel = df.pivot_table(index="trade_date", columns=["tenor_days", "k"],
+                               values="total_var")
+        panel.index = pd.to_datetime(panel.index)
+        return panel.sort_index()
 
     def load_surface_panel(self, symbol) -> pd.DataFrame:
         """Wide panel: rows = trade_date, columns = (tenor_days, k) nodes."""
@@ -277,5 +541,6 @@ class VolDB:
     def table_counts(self) -> dict:
         with self.connect() as con:
             return {t: con.execute(f"SELECT COUNT(*) FROM {t}").fetchone()[0]
-                    for t in ("svi_parameters", "surface_grid", "features",
+                    for t in ("svi_parameters", "ssvi_parameters", "essvi_parameters", "fengler_runs", "surface_grid",
+                              "modeled_surface_grid", "features",
                               "pca_models", "pca_scores")}

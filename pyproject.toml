@@ -4,13 +4,14 @@ build-backend = "hatchling.build"
 
 [project]
 name = "volforge"
-version = "0.1.0"
-description = "SVI volatility surface calibration and relative-value research"
+version = "0.4.0"
+description = "Arbitrage-aware volatility surface calibration and relative-value research"
 requires-python = ">=3.10"
 dependencies = [
     "numpy>=1.24",
     "scipy>=1.10",
     "pandas>=2.0",
+    "yfinance>=1.6.0",
 ]
 
 [project.optional-dependencies]

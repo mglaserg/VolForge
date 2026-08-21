@@ -12,7 +12,7 @@ from types import SimpleNamespace
 import numpy as np
 import pandas as pd
 
-sys.path.insert(0, "../volforge/src")
+# sys.path.insert(0, "../volforge/src")
 
 from volforge import SVIParams, calibrate_svi, svi_total_variance, residual_report
 from volforge.blackscholes import black_price

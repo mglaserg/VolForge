@@ -198,7 +198,7 @@ print(buckets.to_string(float_format=lambda x: f"{x:7.3f}"))
 
 # ---------------------------------------------------------------------- plots
 print("\n[6] plots")
-out = "/home/claude/volforge/figures"
+out = "../volforge/figures"
 import os
 os.makedirs(out, exist_ok=True)
 

@@ -1,7 +1,7 @@
 import sys
 import numpy as np
 
-sys.path.insert(0, "../volforge/src")
+# sys.path.insert(0, "../volforge/src")
 
 from volforge.blackscholes import black_price, implied_vol, implied_vol_vec
 from volforge.forward import fit_forward, log_moneyness

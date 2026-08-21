@@ -1,13 +1,19 @@
 # VolForge
 
-SVI volatility-surface calibration and relative-value research.
+Arbitrage-aware volatility-surface calibration and relative-value research.
 
 ## Status
 
-All phases through 12 are implemented and tested end to end: data ingestion,
+The original raw-SVI research stack is implemented end to end: data ingestion,
 quote cleaning, forward extraction, IV inversion, SVI calibration, arbitrage
-diagnostics, the parameter database, surface construction, features, PCA,
-signal evaluation, and plotting.
+diagnostics, the parameter database, fixed-grid surface construction, features,
+PCA, signal evaluation, and plotting.
+
+Version 0.4 adds two more measurement layers. **eSSVI** extends SSVI with a
+maturity-dependent correlation function and Hendriks-Martini calendar-arbitrage
+conditions. **Fengler** adds a nonparametric constrained natural cubic smoothing
+spline in call-price space with strike and cross-maturity no-arbitrage constraints.
+All four models write to the same model-tagged fixed grid for comparison.
 
 Phase 13 (trading research) is deliberately not written. Trade construction
 depends on what the signal tests actually show, and writing it now would mean
@@ -41,6 +47,111 @@ for s in build_all_slices(clean):
           f"reliable={fit.is_reliable}", fit.boundary_flags)
 ```
 
+## SSVI quickstart
+
+Raw SVI and SSVI have different jobs. Raw SVI remains the flexible fit for one
+expiry. SSVI couples those maturities through ATM total variance and gives a
+global term-structure benchmark.
+
+```python
+from volforge import calibrate_svi, calibrate_ssvi, build_surface
+
+pairs = [(s, calibrate_svi(s.k, s.w, s.T, weights=s.weights)) for s in slices]
+ssvi = calibrate_ssvi(pairs)
+
+print(ssvi.params)
+print(f"global RMSE: {ssvi.rmse_iv*100:.3f} vol points")
+print(f"theta repair: {ssvi.theta_repair_fraction:.2%}")
+print(ssvi.butterfly_free, ssvi.calendar_free)
+
+# arbitrary point on the continuous surface; T is in years
+T30 = 30 / 365.25
+print(ssvi.implied_vol(k=-0.10, T=T30))
+
+# evaluate on the same fixed grid used by PCA and raw SVI
+ssvi_surface = ssvi.to_surface("2026-08-20", "SPY")
+```
+
+The most useful comparison is the independent-slice surface against the coupled
+SSVI surface:
+
+```python
+raw_surface = build_surface(pairs, "2026-08-20", "SPY")
+diff = raw_surface.total_var - ssvi_surface.total_var
+```
+
+That difference asks: *where does an individual expiry want to depart from the
+globally coherent term structure?* It is a measurement, not yet an alpha claim.
+
+### One-command SSVI diagnostic run
+
+```bash
+python scripts/fit_ssvi.py \
+    --chain data/chains/symbol=SPY/date=2026-08-20/chain.parquet \
+    --symbol SPY \
+    --db volforge.db \
+    --plot
+```
+
+This cleans the saved chain, calibrates every raw-SVI slice, fits SSVI, writes
+both model grids without overwriting one another, and opens the SSVI diagnostic
+figure.
+
+### What is stored
+
+`ssvi_parameters` stores the daily global parameters `(rho, eta, gamma)`, the
+ATM theta curve, fit quality, repair amount, and arbitrage diagnostics.
+`modeled_surface_grid` stores model-tagged fixed-grid nodes, so `svi`, `ssvi`,
+and later `essvi` / `fengler` can coexist for the same symbol and date.
+
+```python
+db.save_ssvi_fit("SPY", date, ssvi)
+db.save_model_surface("SPY", date, "svi", raw_surface)
+db.save_model_surface("SPY", date, "ssvi", ssvi_surface)
+
+svi_hist = db.load_model_surface_panel("SPY", "svi")
+ssvi_hist = db.load_model_surface_panel("SPY", "ssvi")
+```
+
+## eSSVI quickstart
+
+```bash
+python scripts/run_essvi.py \
+    --chain data/chains/symbol=SPY/date=2026-08-20/chain.parquet \
+    --symbol SPY --db volforge.db --plot
+```
+
+The runner calibrates raw SVI, nested SSVI, and eSSVI on the same chain and reports
+the eSSVI fit improvement. The eSSVI correlation family is
+`rho(theta)=rho0+(rho_m-rho0)(theta/theta_max)^a` over the calibrated horizon.
+The continuous Hendriks-Martini calendar condition and slice-wise SSVI butterfly
+conditions are enforced during calibration. Results are stored in
+`essvi_parameters` and `modeled_surface_grid` with `model='essvi'`.
+
+## Fengler quickstart
+
+```bash
+python scripts/run_fengler.py \
+    --chain data/chains/symbol=SPY/date=2026-08-20/chain.parquet \
+    --symbol SPY --lambda 1e-5 --db volforge.db --plot
+```
+
+Fengler is intentionally different from SVI-family models: it smooths
+forward-normalised call prices with a natural cubic spline. Convexity, monotonicity,
+price bounds, endpoint slope bounds, and dense equal-forward-moneyness calendar
+constraints are imposed in the spline optimisation. The resulting surface is
+converted back to total variance only after the price surface is clean. Results are
+stored in `fengler_runs` and the common grid with `model='fengler'`.
+
+The smoothing parameter `--lambda` is explicit in v0.4; automated AIC/GCV selection
+is deliberately left as a later calibration enhancement rather than hidden inside
+the first implementation.
+
+**SPY caveat:** the theoretical Fengler construction is for European option prices.
+SPY options are American-style, so early-exercise/dividend effects can contaminate
+strict parity/arbitrage diagnostics. SPY remains useful for workflow research, but
+SPX is the cleaner validation market for the exact European theory.
+
 Accumulate history (yfinance has no historical endpoint — capture or lose it):
 
 ```bash
@@ -55,6 +166,10 @@ src/volforge/
 ├── blackscholes.py    Black-76 in forward space, IV inversion
 ├── forward.py         put-call parity regression -> F and D jointly
 ├── svi.py             raw SVI, quasi-explicit calibration, arbitrage checks
+├── term_structure.py  monotone ATM total-variance clock for SSVI/eSSVI
+├── ssvi.py            coupled SSVI surface + calibration + no-arbitrage checks
+├── essvi.py           maturity-dependent-rho eSSVI + calendar conditions
+├── fengler.py         constrained natural call-price smoothing splines
 ├── diagnostics.py     residuals measured in half-spread units
 ├── surface.py         all expiries -> fixed grid, calendar repair
 ├── features.py        ATM, skew, curvature, wing asymmetry, term structure
@@ -172,8 +287,43 @@ these cut a fit from roughly 460ms to 50ms, which is the difference between a
 multi-year calibration taking hours and taking minutes. `calibrate_svi(..., x0=)`
 warm-starts from the previous day's `(m, sigma)`.
 
-## Not yet built
+## Roadmap
 
-Phase 13: delta- and vega-neutral trade construction, structure selection
-(butterflies, verticals, calendars, condors), turnover, and out-of-sample
-backtesting. Do the Phase 8 gate first.
+The next surface-infrastructure steps are intentionally separated from alpha
+research:
+
+1. SSVI — **implemented**.
+2. Fengler arbitrage-free smoothing surface — **implemented in v0.4**.
+3. Hendriks-Martini eSSVI — **implemented in v0.4**.
+4. Robust eSSVI/SSVI slice calibration and arbitrage-free interpolation.
+5. Minimal static-arbitrage detection and repair before calibration.
+6. Only after the measurement layer is stable: delta/vega-neutral trade
+   construction, turnover, costs, and out-of-sample testing.
+
+## Raw SVI runner
+
+Run the complete per-expiry SVI pipeline from a saved raw chain snapshot:
+
+```bash
+python scripts/run_svi.py \
+  --chain data/chains/symbol=SPY/date=2026-08-20/chain.parquet \
+  --symbol SPY \
+  --db volforge.db \
+  --plot
+```
+
+To write the diagnostic figures without opening matplotlib windows:
+
+```bash
+python scripts/run_svi.py \
+  --chain data/chains/symbol=SPY/date=2026-08-20/chain.parquet \
+  --symbol SPY \
+  --db volforge.db \
+  --save-plots figures/svi/2026-08-20
+```
+
+The runner saves all raw SVI slice parameters to `svi_parameters`, the legacy
+fixed-grid surface to `surface_grid`, and the model-tagged SVI grid to
+`modeled_surface_grid` with `model='svi'`.  By default only reliable SVI slices
+are allowed into the fixed-grid surface and calendar total-variance inversions
+are repaired while the repair amount is retained on the `Surface` object.
