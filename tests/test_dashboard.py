@@ -78,3 +78,31 @@ def test_prepare_vrp_history_adds_no_lookahead_features_and_forward_label():
     out = prepare_vrp_history(hist, z_window=20, min_periods=5)
     assert {"vrp", "vrp_z", "vrp_percentile", "mfiv_vol", "vol_of_vol", "forward_vrp"} <= set(out.columns)
     assert np.isclose(out["forward_vrp"].iloc[-1], mfiv.iloc[-1] - (rv.iloc[-1] + 0.002))
+
+
+def test_classify_vrp_context_identifies_post_shock_cooling():
+    from dataclasses import replace
+    from volforge.dashboard import classify_vrp_context
+
+    snap = build_dashboard_snapshot(_chain(), _bars(), target_days=30, min_mfiv_strikes=20)
+    hist = snap.realized_history.copy()
+    # Force a clear recent transition: positive RV slope followed by negative.
+    hist.loc[hist.index[-3], "rv_3"] = hist.loc[hist.index[-3], "rv_30"] + 0.10
+    hist.loc[hist.index[-1], "rv_3"] = max(hist.loc[hist.index[-1], "rv_30"] - 0.05, 0.001)
+    snap = replace(snap, realized_history=hist)
+    ctx = classify_vrp_context(snap, mfiv_variance=snap.trailing_target_variance + 0.01, lookback=5)
+    assert ctx.state == "Post-shock / IV still elevated"
+    assert ctx.cooling_from_shock
+    assert ctx.premium_positive
+
+
+def test_surface_mfiv_comparison_builds_ssvi_and_fengler():
+    from volforge.dashboard import build_surface_mfiv_comparison
+
+    c = _chain((20, 30, 40, 60), sigma=0.20)
+    c["volume"] = 100
+    c["open_interest"] = 100
+    results = build_surface_mfiv_comparison(c, target_days=30, dte_range=(7, 90))
+    assert {"SSVI", "Fengler"} == set(results)
+    assert abs(results["SSVI"].target.implied_volatility - 0.20) < 0.03
+    assert abs(results["Fengler"].target.implied_volatility - 0.20) < 0.03

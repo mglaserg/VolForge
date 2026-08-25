@@ -47,3 +47,25 @@ def test_constant_tenor_interpolates_total_variance():
     ct = constant_tenor_mfiv([s1, s2], 30)
     expected_theta = s1.total_variance + 0.5 * (s2.total_variance - s1.total_variance)
     assert np.isclose(ct.implied_variance, expected_theta / (30 / 365.25), rtol=1e-10)
+
+
+def test_mfiv_from_model_recovers_flat_vol_on_observed_support():
+    from volforge.mfiv import mfiv_from_model
+    from volforge.forward import fit_forward
+
+    c = _chain(30, sigma=0.20)
+    exp = c["expiry"].iloc[0]
+    sl = c[c["expiry"] == exp]
+    piv = sl.pivot(index="strike", columns="right", values="mid").dropna()
+    T = float(sl["T"].median())
+    ff = fit_forward(piv.index.to_numpy(), piv["C"].to_numpy(), piv["P"].to_numpy(), T, spot=100.0)
+    got = mfiv_from_model(
+        expiry=exp,
+        T=T,
+        forward_fit=ff,
+        strikes=sl["strike"].unique(),
+        implied_vol_fn=lambda k: np.full_like(np.asarray(k, float), 0.20),
+        label="flat",
+        min_strikes=20,
+    )
+    assert abs(got.implied_variance - 0.20**2) < 0.003

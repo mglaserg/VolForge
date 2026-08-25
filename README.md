@@ -371,3 +371,24 @@ it is convenient for inspecting the live calculations, but the research model
 should ultimately be trained on a retained, research-grade high-frequency data
 history. The history tab also intentionally consumes derived local data rather
 than automatically making hundreds of paid historical option-chain API calls.
+
+### VRP regime guide and surface confirmation
+
+The dashboard now includes a **How to use** page that can be opened without
+fetching market data.  It teaches the intended reading sequence rather than
+turning `RV3 - RV30` into a mechanical trade rule.
+
+The live page classifies the realized-volatility context as one of several
+states, including **Shock underway** and **Post-shock / IV still elevated**.
+The latter requires more than `RV3 < RV30`: the recent RV slope must previously
+have been positive and implied variance must still exceed trailing integrated
+RV.  This captures the cooling-after-shock pattern discussed in the VRP
+research notes.
+
+The sidebar also supports headline MFIV from **Raw strip**, **SSVI**, or
+**Fengler**.  SSVI/Fengler values are produced by fitting the current cleaned
+chain, repricing on each expiry's observed strike support, and integrating those
+smoothed option prices with the same model-free variance formula.  The
+**Surface models** tab compares the resulting constant-tenor MFIV values,
+term structures, fit reliability, and model-vs-raw differences.  Large gaps are
+a diagnostic warning, not an automatic signal.

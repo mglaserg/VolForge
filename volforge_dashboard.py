@@ -18,11 +18,85 @@ import numpy as np
 import pandas as pd
 import streamlit as st
 
-from volforge.dashboard import build_dashboard_snapshot, normalise_intraday_bars, prepare_vrp_history
+from volforge.dashboard import (
+    build_dashboard_snapshot,
+    build_surface_mfiv_comparison,
+    classify_vrp_context,
+    normalise_intraday_bars,
+    prepare_vrp_history,
+)
 from volforge.data.provider import available_providers, fetch_chain
 
 
 st.set_page_config(page_title="VolForge · Forward VRP", page_icon="〽", layout="wide")
+
+
+def _render_demo_page():
+    st.title("VolForge · How to Use Forward VRP")
+    st.caption("A practical reading guide. These states are research context, not automatic trade signals.")
+
+    st.subheader("The question VolForge is trying to answer")
+    st.latex(r"\mathrm{Expected\ VRP}_{30} = \mathrm{MFIV}_{30}^{2} - \widehat{RV}_{t\rightarrow t+30}^{2}")
+    st.write(
+        "Today the live dashboard compares MFIV with **trailing** integrated RV. Later, the forecasting layer "
+        "will replace trailing RV with a genuine forward-RV forecast. The RV3/RV30 slope tells you what the "
+        "realized-volatility regime is doing; it is not the edge by itself."
+    )
+
+    st.subheader("The shock → cooling → lingering-premium pattern")
+    demo = pd.DataFrame({
+        "Stage": ["Shock underway", "Cooling", "Post-shock / IV still elevated"],
+        "RV3": [0.40, 0.27, 0.16],
+        "RV30": [0.22, 0.24, 0.23],
+        "MFIV30": [0.35, 0.34, 0.31],
+    })
+    demo["RV3 − RV30"] = demo["RV3"] - demo["RV30"]
+    chart = demo.set_index("Stage")[["RV3", "RV30", "MFIV30"]] * 100
+    st.line_chart(chart)
+    shown = demo.copy()
+    for c in ["RV3", "RV30", "MFIV30", "RV3 − RV30"]:
+        shown[c] = (100 * shown[c]).map(lambda x: f"{x:.1f}%")
+    st.dataframe(shown, use_container_width=True, hide_index=True)
+
+    st.info(
+        "The third state is the one to investigate most closely: RV3 has cooled below RV30 after a recent shock, "
+        "but MFIV30 is still high. That can mean insurance premiums are staying elevated after realized risk has begun to normalize."
+    )
+
+    st.subheader("How to read a live symbol")
+    st.markdown(
+        """
+1. **Premium:** Is MFIV30 above trailing RV30, and by a meaningful amount?
+2. **Stretch:** With history loaded, is VRP unusually high by z-score/percentile?
+3. **Regime:** Is RV3 above RV30 (shock active), falling through RV30 (cooling), or simply calm?
+4. **Persistence:** Did RV3 recently spike above RV30 before falling below it? That transition is more informative than either sign alone.
+5. **Surface quality:** Compare raw-strip MFIV with SSVI and Fengler. Small differences are reassuring; large differences tell you to inspect quotes/surface fit before trusting the VRP reading.
+6. **No automatic trade:** A strong context still needs portfolio/tail-risk rules and, later, the forward-RV model.
+"""
+    )
+
+    st.subheader("RV3 / RV30 context matrix")
+    matrix = pd.DataFrame([
+        {"RV state": "RV3 > RV30", "MFIV state": "High", "Read": "Shock active; premium may be forming, but realized risk is still hot."},
+        {"RV state": "RV3 > RV30", "MFIV state": "Not high", "Read": "Poor compensation for an active shock."},
+        {"RV state": "RV3 < RV30 after recent positive slope", "MFIV state": "Still high", "Read": "Post-shock / lingering-premium candidate; especially worth researching."},
+        {"RV state": "RV3 < RV30", "MFIV state": "Low", "Read": "Calm market, but probably little premium to harvest."},
+    ])
+    st.dataframe(matrix, use_container_width=True, hide_index=True)
+
+    st.subheader("Why compare Raw, SSVI, and Fengler?")
+    st.write(
+        "Raw-strip MFIV uses the observed option quotes directly. SSVI gives a global parametric, static-arbitrage-aware "
+        "surface; Fengler smooths in option-price space under convexity/monotonicity/calendar constraints. VolForge integrates "
+        "each model over the **same observed strike support** so differences reflect smoothing/model quality rather than a different wing domain."
+    )
+    st.caption("If a model is flagged unreliable, do not use its smoothed MFIV as confirmation. Treat the disagreement itself as a diagnostic.")
+
+
+page = st.sidebar.radio("Page", ("Forward VRP dashboard", "How to use"), index=0)
+if page == "How to use":
+    _render_demo_page()
+    st.stop()
 
 
 def _pct(x: float, digits: int = 1) -> str:
@@ -90,7 +164,9 @@ with st.sidebar:
     st.header("Snapshot")
     symbol = st.text_input("Symbol", "SPY").strip().upper()
     provider = st.selectbox("Option provider", available_providers(), index=0)
-    price_side = st.radio("MFIV quote side", ("mid", "bid"), horizontal=True)
+    price_side = st.radio("Raw MFIV quote side", ("mid", "bid"), horizontal=True)
+    mfiv_source = st.selectbox("Headline MFIV source", ("Raw strip", "SSVI", "Fengler"), index=0)
+    compare_surface_models = st.checkbox("Fit / compare SSVI + Fengler", value=False)
     target_days = st.number_input("Constant tenor (days)", min_value=7, max_value=180, value=30, step=1)
     dte_lo, dte_hi = st.slider("Option DTE range", min_value=1, max_value=365, value=(7, 180))
     max_expiries = st.number_input("Max expiries", min_value=2, max_value=40, value=16, step=1)
@@ -139,35 +215,66 @@ try:
             target_days=float(target_days),
             price_side=price_side,
         )
+
+        surface_results = {}
+        if compare_surface_models or mfiv_source != "Raw strip":
+            surface_results = build_surface_mfiv_comparison(
+                chain,
+                target_days=float(target_days),
+                dte_range=(float(dte_lo), float(dte_hi)),
+            )
 except Exception as exc:
     st.error(f"Could not build the snapshot: {exc}")
     if provider == "orats":
         st.caption("ORATS requires ORATS_API_TOKEN in the environment and the appropriate data entitlement.")
     st.stop()
 
+selected_name = mfiv_source
+selected_target = snapshot.target_mfiv
+if mfiv_source != "Raw strip":
+    result = surface_results.get(mfiv_source)
+    if result is None:
+        st.warning(f"{mfiv_source} MFIV was unavailable; falling back to the raw strip.")
+        selected_name = "Raw strip"
+    else:
+        selected_target = result.target
+        if not result.reliable:
+            st.warning(f"{mfiv_source} fit is not marked reliable. Use it as a diagnostic, not confirmation.")
+
+selected_vrp_variance = float(selected_target.implied_variance - snapshot.trailing_target_variance)
+selected_vol_spread = float(selected_target.implied_volatility - snapshot.trailing_target_volatility)
+context = classify_vrp_context(snapshot, mfiv_variance=selected_target.implied_variance)
+
 quote_local = snapshot.quote_time.tz_convert("America/New_York")
 st.caption(
     f"{snapshot.symbol} · option quote {quote_local:%Y-%m-%d %H:%M %Z} · "
-    f"provider {provider} · {price_side} MFIV"
+    f"provider {provider} · headline {selected_name} MFIV"
 )
 
 c1, c2, c3, c4, c5 = st.columns(5)
-c1.metric(f"MFIV {target_days}d", _pct(snapshot.target_mfiv.implied_volatility))
+c1.metric(f"{selected_name} MFIV {target_days}d", _pct(selected_target.implied_volatility))
 c2.metric(f"Trailing integrated RV {target_days}d", _pct(snapshot.trailing_target_volatility))
-c3.metric("Vol spread", _pct(snapshot.current_vol_spread))
-c4.metric("VRP variance pts", _var_pts(snapshot.current_vrp_variance))
+c3.metric("Vol spread", _pct(selected_vol_spread))
+c4.metric("VRP variance pts", _var_pts(selected_vrp_variance))
 rv_3 = snapshot.realized_curve.loc[snapshot.realized_curve["days"] == 3, "realized_volatility"]
 rv_30 = snapshot.realized_curve.loc[snapshot.realized_curve["days"] == 30, "realized_volatility"]
 rv_slope = float(rv_3.iloc[0] - rv_30.iloc[0]) if len(rv_3) and len(rv_30) else np.nan
 c5.metric("RV 3d − 30d", _pct(rv_slope))
 
-if snapshot.current_vrp_variance > 0:
-    st.success("Current implied variance is above trailing integrated realized variance.")
-else:
-    st.warning("Current implied variance is not above trailing integrated realized variance.")
+st.subheader(context.state)
+st.write(context.explanation)
+ctx1, ctx2, ctx3 = st.columns(3)
+ctx1.metric("Current RV3 − RV30", _pct(context.rv_slope))
+ctx2.metric("Recent slope peak", _pct(context.recent_slope_peak))
+ctx3.metric("Cooling from recent shock?", "Yes" if context.cooling_from_shock else "No")
 
-current_tab, history_tab, diagnostics_tab, raw_tab = st.tabs(
-    ["Current snapshot", "History / features", "Diagnostics", "Raw chain"]
+if selected_vrp_variance > 0:
+    st.success("Selected implied variance is above trailing integrated realized variance.")
+else:
+    st.warning("Selected implied variance is not above trailing integrated realized variance.")
+
+current_tab, surface_tab, history_tab, diagnostics_tab, raw_tab = st.tabs(
+    ["Current snapshot", "Surface models", "History / features", "Diagnostics", "Raw chain"]
 )
 
 with current_tab:
@@ -201,6 +308,43 @@ with current_tab:
     if rv_cols:
         hist_plot = snapshot.realized_history[rv_cols].dropna(how="all") * 100
         st.line_chart(hist_plot)
+
+with surface_tab:
+    st.subheader("Raw strip vs surface-smoothed MFIV")
+    st.write(
+        "SSVI and Fengler are fit to the cleaned current chain, repriced on the same observed strike support, "
+        "and then integrated with the same MFIV formula. This is a diagnostic comparison, not a model vote."
+    )
+    if not surface_results:
+        st.info("Enable **Fit / compare SSVI + Fengler** in the sidebar, or choose one as the headline MFIV source.")
+    else:
+        rows = [{
+            "model": "Raw strip",
+            "mfiv": snapshot.target_mfiv.implied_volatility,
+            "variance": snapshot.target_mfiv.implied_variance,
+            "reliable": True,
+            "rmse_iv": np.nan,
+            "detail": f"{price_side} observed quotes",
+        }]
+        for name, result in surface_results.items():
+            rows.append({
+                "model": name, "mfiv": result.target.implied_volatility,
+                "variance": result.target.implied_variance, "reliable": result.reliable,
+                "rmse_iv": result.rmse_iv, "detail": result.detail,
+            })
+        comp = pd.DataFrame(rows)
+        comp["difference_vs_raw"] = comp["mfiv"] - snapshot.target_mfiv.implied_volatility
+        display_comp = comp.copy()
+        for col in ("mfiv", "difference_vs_raw", "rmse_iv"):
+            display_comp[col] = 100 * display_comp[col]
+        st.dataframe(display_comp, use_container_width=True, hide_index=True)
+
+        plot = pd.DataFrame({"Raw strip": snapshot.mfiv_curve.set_index("dte")["implied_volatility"] * 100})
+        for name, result in surface_results.items():
+            if not result.curve.empty:
+                plot = plot.join(result.curve.set_index("dte")[["implied_volatility"]].rename(columns={"implied_volatility": name}) * 100, how="outer")
+        st.line_chart(plot.sort_index())
+        st.caption("A large Raw-vs-model gap is a reason to inspect chain quality, strike coverage, and model reliability before interpreting VRP.")
 
 with history_tab:
     st.subheader("Daily VRP history")

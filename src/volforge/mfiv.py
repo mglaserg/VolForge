@@ -14,6 +14,7 @@ import numpy as np
 import pandas as pd
 
 from .forward import ForwardFit, fit_forward
+from .blackscholes import black_price
 from .data.clean import matched_pairs
 from .data.schema import add_derived_columns
 
@@ -23,6 +24,7 @@ __all__ = [
     "mfiv_for_expiry",
     "mfiv_term_structure",
     "constant_tenor_mfiv",
+    "mfiv_from_model",
 ]
 
 DAYS_PER_YEAR = 365.25
@@ -218,4 +220,81 @@ def constant_tenor_mfiv(
         lower_days=lo.dte,
         upper_days=hi.dte,
         interpolation_weight=float(weight),
+    )
+
+
+def mfiv_from_model(
+    *,
+    expiry,
+    T: float,
+    forward_fit: ForwardFit,
+    strikes,
+    implied_vol_fn,
+    label: str = "model",
+    min_strikes: int = 8,
+) -> MFIVSlice:
+    """Integrate model-smoothed option prices on an observed strike support.
+
+    ``implied_vol_fn`` receives log-forward-moneyness ``k = log(K/F)`` and
+    returns annualized Black implied volatility.  Using the observed strike
+    support keeps raw-vs-model MFIV comparisons honest: the smoother changes
+    quote shape, not the integration domain.
+    """
+    T = float(T)
+    if T <= 0:
+        raise ValueError("T must be positive")
+    F = float(forward_fit.forward)
+    D = float(forward_fit.discount)
+    K_all = np.unique(np.asarray(strikes, float))
+    K_all = K_all[np.isfinite(K_all) & (K_all > 0)]
+    K_all.sort()
+    below = K_all[K_all <= F]
+    if len(below) == 0:
+        raise ValueError("no strike at or below forward for K0")
+    k0 = float(below[-1])
+
+    logk = np.log(K_all / F)
+    iv = np.asarray(implied_vol_fn(logk), float)
+    ok = np.isfinite(iv) & (iv > 0)
+    K_all, iv = K_all[ok], iv[ok]
+    if len(K_all) < min_strikes:
+        raise ValueError(f"need >= {min_strikes} model strikes for MFIV, got {len(K_all)}")
+
+    selected_k, selected_q = [], []
+    for K, sig in zip(K_all, iv):
+        if K < k0:
+            q = float(black_price(F, K, sig, T, False, D))
+        elif K > k0:
+            q = float(black_price(F, K, sig, T, True, D))
+        else:
+            q = 0.5 * (float(black_price(F, K, sig, T, True, D)) + float(black_price(F, K, sig, T, False, D)))
+        if np.isfinite(q) and q > 0:
+            selected_k.append(float(K))
+            selected_q.append(q)
+
+    K = np.asarray(selected_k, float)
+    Q = np.asarray(selected_q, float)
+    if len(K) < min_strikes:
+        raise ValueError(f"need >= {min_strikes} positive model option prices, got {len(K)}")
+    order = np.argsort(K)
+    K, Q = K[order], Q[order]
+    dK = np.empty_like(K)
+    dK[1:-1] = (K[2:] - K[:-2]) / 2.0
+    dK[0] = K[1] - K[0]
+    dK[-1] = K[-1] - K[-2]
+    integral = (2.0 / T) * np.sum((dK / (K ** 2)) * (Q / D))
+    forward_adjustment = ((F / k0) - 1.0) ** 2 / T
+    variance = float(integral - forward_adjustment)
+    if not np.isfinite(variance) or variance <= 0:
+        raise ValueError(f"model MFIV produced non-positive variance {variance}")
+    return MFIVSlice(
+        expiry=pd.Timestamp(expiry),
+        T=T,
+        dte=T * DAYS_PER_YEAR,
+        implied_variance=variance,
+        implied_volatility=float(np.sqrt(variance)),
+        forward_fit=forward_fit,
+        k0=k0,
+        n_strikes=len(K),
+        price_side=label,
     )

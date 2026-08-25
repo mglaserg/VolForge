@@ -28,6 +28,10 @@ __all__ = [
     "build_dashboard_snapshot",
     "normalise_intraday_bars",
     "prepare_vrp_history",
+    "VRPContext",
+    "SurfaceMFIVResult",
+    "classify_vrp_context",
+    "build_surface_mfiv_comparison",
 ]
 
 
@@ -271,3 +275,159 @@ def prepare_vrp_history(
         out["forward_rv_vol"] = integrated_volatility(out["forward_rv_var"])
         out["forward_vrp"] = forward_vrp_label(out["mfiv_var"], out["forward_rv_var"])
     return out
+
+
+@dataclass(frozen=True)
+class VRPContext:
+    state: str
+    explanation: str
+    rv_slope: float
+    recent_slope_peak: float
+    cooling_from_shock: bool
+    premium_positive: bool
+
+
+@dataclass(frozen=True)
+class SurfaceMFIVResult:
+    name: str
+    target: ConstantTenorMFIV
+    curve: pd.DataFrame
+    reliable: bool
+    rmse_iv: float
+    detail: str
+
+
+def classify_vrp_context(
+    snapshot: DashboardSnapshot,
+    *,
+    mfiv_variance: float | None = None,
+    lookback: int = 10,
+) -> VRPContext:
+    """Describe the RV3/RV30 state without pretending it is a trade rule."""
+    hist = snapshot.realized_history
+    if not {"rv_3", "rv_30"}.issubset(hist.columns):
+        return VRPContext("Insufficient RV history", "Need RV3 and RV30.", np.nan, np.nan, False, False)
+    slope = (hist["rv_3"] - hist["rv_30"]).dropna()
+    if slope.empty:
+        return VRPContext("Insufficient RV history", "Need RV3 and RV30.", np.nan, np.nan, False, False)
+    current = float(slope.iloc[-1])
+    recent_peak = float(slope.tail(max(int(lookback), 2)).max())
+    cooling = bool(current < 0 and recent_peak > 0)
+    implied = snapshot.target_mfiv.implied_variance if mfiv_variance is None else float(mfiv_variance)
+    premium = bool(implied > snapshot.trailing_target_variance)
+
+    if current > 0:
+        state = "Shock underway"
+        explanation = "RV3 is above RV30: short-term realized volatility is hotter than the monthly window. Premium may be forming, but the shock is still active."
+    elif cooling and premium:
+        state = "Post-shock / IV still elevated"
+        explanation = "RV3 has fallen below RV30 after a recent positive slope, while implied variance still exceeds trailing RV. This is the cooling-after-shock pattern worth researching."
+    elif current < 0 and premium:
+        state = "Calm / premium positive"
+        explanation = "RV3 is below RV30 and implied variance exceeds trailing RV, but there was no recent RV-slope shock in the selected lookback."
+    elif current < 0:
+        state = "Calm / little premium"
+        explanation = "Realized volatility is calm, but implied variance is not compensating much above trailing RV."
+    else:
+        state = "Flat RV slope"
+        explanation = "RV3 and RV30 are roughly aligned; use VRP stretch and the broader term structure for context."
+    return VRPContext(state, explanation, current, recent_peak, cooling, premium)
+
+
+def build_surface_mfiv_comparison(
+    chain: pd.DataFrame,
+    *,
+    target_days: float = 30.0,
+    dte_range: tuple[float, float] = (7.0, 180.0),
+    min_strikes: int = 8,
+    fengler_lambda: float = 1e-5,
+) -> dict[str, SurfaceMFIVResult]:
+    """Fit SSVI and Fengler and integrate their smoothed option prices.
+
+    Both models are integrated on each expiry's observed strike support, then
+    converted to a constant tenor in total-variance time.  This makes their
+    MFIV directly comparable with the raw-strip calculation.
+    """
+    from .data.clean import CleanConfig, clean_chain
+    from .data.pipeline import build_all_slices
+    from .svi import calibrate_svi
+    from .ssvi import calibrate_ssvi
+    from .fengler import fit_fengler_surface
+    from .mfiv import mfiv_from_model
+
+    clean, _ = clean_chain(
+        chain,
+        CleanConfig(dte_range=dte_range, require_activity=False),
+        verbose=False,
+    )
+    slices = build_all_slices(clean, verbose=False)
+    if len(slices) < 3:
+        raise ValueError("need at least three calibratable expiries for SSVI/Fengler")
+
+    pairs = [(s, calibrate_svi(s.k, s.w, s.T, weights=s.weights)) for s in slices]
+    ssvi_anchor_mode = "reliable raw-SVI anchors"
+    try:
+        ssvi = calibrate_ssvi(pairs, reliable_only=True)
+    except ValueError:
+        # Flat/synthetic or boundary-pinned raw-SVI slices can be successful yet
+        # fail the stricter reliability gate.  Permit a diagnostic fit, but mark
+        # it non-confirmatory in the result metadata.
+        ssvi = calibrate_ssvi(pairs, reliable_only=False)
+        ssvi_anchor_mode = "successful raw-SVI anchors (diagnostic fallback)"
+    ssvi_slices = []
+    for s in slices:
+        strikes = clean.loc[clean["expiry"] == s.expiry, "strike"].unique()
+        try:
+            ssvi_slices.append(mfiv_from_model(
+                expiry=s.expiry,
+                T=s.T,
+                forward_fit=s.forward_fit,
+                strikes=strikes,
+                implied_vol_fn=lambda k, T=s.T: ssvi.implied_vol(k, T),
+                label="ssvi",
+                min_strikes=min_strikes,
+            ))
+        except ValueError:
+            continue
+    ssvi_target = constant_tenor_mfiv(ssvi_slices, target_days)
+
+    fengler = fit_fengler_surface(slices, smoothing_lambda=fengler_lambda)
+    fengler_slices = []
+    originals = sorted(slices, key=lambda s: s.T)
+    for fit, s in zip(fengler.slices, originals):
+        strikes = clean.loc[clean["expiry"] == s.expiry, "strike"].unique()
+        try:
+            fengler_slices.append(mfiv_from_model(
+                expiry=s.expiry,
+                T=s.T,
+                forward_fit=s.forward_fit,
+                strikes=strikes,
+                implied_vol_fn=lambda k, f=fit: f.implied_vol(k, allow_extrapolation=False),
+                label="fengler",
+                min_strikes=min_strikes,
+            ))
+        except ValueError:
+            continue
+    fengler_target = constant_tenor_mfiv(fengler_slices, target_days)
+
+    def frame(ss):
+        return pd.DataFrame([{
+            "expiry": x.expiry, "dte": x.dte,
+            "implied_variance": x.implied_variance,
+            "implied_volatility": x.implied_volatility,
+            "n_strikes": x.n_strikes,
+        } for x in ss]).sort_values("dte").reset_index(drop=True)
+
+    return {
+        "SSVI": SurfaceMFIVResult(
+            "SSVI", ssvi_target, frame(ssvi_slices),
+            bool(ssvi.is_reliable and ssvi_anchor_mode == "reliable raw-SVI anchors"),
+            float(ssvi.rmse_iv),
+            f"butterfly={ssvi.butterfly_free}, calendar={ssvi.calendar_free}, theta repair={ssvi.theta_repair_fraction:.2%}; {ssvi_anchor_mode}",
+        ),
+        "Fengler": SurfaceMFIVResult(
+            "Fengler", fengler_target, frame(fengler_slices), bool(fengler.is_reliable),
+            float(fengler.rmse_iv),
+            f"strike-arb={fengler.butterfly_free}, calendar={fengler.calendar_free}",
+        ),
+    }
