@@ -327,3 +327,47 @@ fixed-grid surface to `surface_grid`, and the model-tagged SVI grid to
 `modeled_surface_grid` with `model='svi'`.  By default only reliable SVI slices
 are allowed into the fixed-grid surface and calendar total-variance inversions
 are repaired while the repair amount is retained on the `Surface` object.
+
+## Forward VRP dashboard
+
+VolForge includes a Streamlit measurement dashboard for the Forward VRP work.
+It keeps the live measurement problem separate from the later ML/trade layer:
+current MFIV is compared with trailing integrated realized variance, while the
+true forward-VRP label remains MFIV today minus variance realized strictly in
+the future.
+
+Install the dashboard extra (and the data extra if you want Parquet inputs):
+
+```bash
+pip install -e ".[dashboard,data]"
+```
+
+Run it from the repository root:
+
+```bash
+streamlit run volforge_dashboard.py
+```
+
+On Windows you can also run:
+
+```text
+scripts\run_dashboard.bat
+```
+
+The dashboard currently provides:
+
+- Yahoo or ORATS option-provider selection through the provider registry;
+- mid-side or bid-side model-free implied variance;
+- constant-tenor MFIV interpolated in total variance;
+- 5/15-minute integrated realized variance including overnight gaps;
+- current MFIV-versus-trailing-RV comparison and RV 3d/9d/30d/60d/180d term structure;
+- option-chain quality diagnostics and the MFIV expiry-level calculation table;
+- a historical-feature tab that accepts compact `date,mfiv_var,trailing_rv_var`
+  files, with optional `forward_rv_var`, and calculates VRP z-scores,
+  percentiles, vol-of-vol, and the ex-post forward-VRP label without lookahead.
+
+The built-in Yahoo intraday-bar option is intentionally labeled a **preview**:
+it is convenient for inspecting the live calculations, but the research model
+should ultimately be trained on a retained, research-grade high-frequency data
+history. The history tab also intentionally consumes derived local data rather
+than automatically making hundreds of paid historical option-chain API calls.

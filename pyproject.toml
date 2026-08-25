@@ -17,6 +17,7 @@ dependencies = [
 [project.optional-dependencies]
 data = ["pyarrow>=14", "duckdb>=0.10"]
 viz = ["matplotlib>=3.7", "plotly>=5.18"]
+dashboard = ["streamlit>=1.30"]
 dev = ["pytest>=7.4", "ruff>=0.4", "jupyter"]
 
 [tool.hatch.build.targets.wheel]
