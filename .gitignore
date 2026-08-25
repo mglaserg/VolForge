@@ -13,5 +13,5 @@ build/
 
 # Market data snapshots: large, regenerable-only-going-forward, and
 # potentially licence-restricted. Back these up outside git.
-data/
+/data/
 *.parquet
