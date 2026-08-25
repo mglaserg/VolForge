@@ -132,6 +132,65 @@ def _fetch_yahoo_intraday(symbol: str, interval: str, period: str) -> pd.DataFra
     return normalise_intraday_bars(raw)
 
 
+def _surface_focus_dte_range(
+    chain: pd.DataFrame,
+    *,
+    target_days: float,
+    user_range: tuple[float, float],
+) -> tuple[float, float]:
+    """Return a tight expiry window around the target tenor.
+
+    Surface confirmation only needs enough maturities to bracket the target and
+    identify the local term structure.  Restricting the fit to nearby expiries
+    avoids recalibrating the whole 7--180d surface for a 30d diagnostic.
+    """
+    lo, hi = map(float, user_range)
+    dtes = pd.to_numeric(chain.get("dte"), errors="coerce")
+    dtes = np.array(sorted(set(float(x) for x in dtes.dropna() if lo <= float(x) <= hi)))
+    if len(dtes) <= 5:
+        return lo, hi
+
+    target = float(target_days)
+    below = dtes[dtes < target]
+    above = dtes[dtes > target]
+    exact = dtes[np.isclose(dtes, target, atol=1e-8)]
+
+    chosen: list[float] = []
+    chosen.extend(below[-2:].tolist())
+    chosen.extend(exact[:1].tolist())
+    chosen.extend(above[:2].tolist())
+
+    # SSVI/Fengler need at least three calibratable maturities. Fill from the
+    # nearest expiries if one side of the target is sparse.
+    if len(set(chosen)) < 3:
+        nearest = dtes[np.argsort(np.abs(dtes - target))]
+        for dte in nearest:
+            if float(dte) not in chosen:
+                chosen.append(float(dte))
+            if len(set(chosen)) >= 3:
+                break
+
+    chosen = sorted(set(chosen))
+    if len(chosen) < 3:
+        return lo, hi
+    return max(lo, chosen[0] - 1e-6), min(hi, chosen[-1] + 1e-6)
+
+
+@st.cache_data(show_spinner=False, max_entries=16)
+def _build_surface_comparison_cached(
+    chain: pd.DataFrame,
+    target_days: float,
+    fit_lo: float,
+    fit_hi: float,
+):
+    """Cache expensive SSVI/Fengler fits by option-chain snapshot."""
+    return build_surface_mfiv_comparison(
+        chain,
+        target_days=float(target_days),
+        dte_range=(float(fit_lo), float(fit_hi)),
+    )
+
+
 def _read_table_from_upload(uploaded) -> pd.DataFrame:
     name = uploaded.name.lower()
     payload = uploaded.getvalue()
@@ -165,8 +224,6 @@ with st.sidebar:
     symbol = st.text_input("Symbol", "SPY").strip().upper()
     provider = st.selectbox("Option provider", available_providers(), index=0)
     price_side = st.radio("Raw MFIV quote side", ("mid", "bid"), horizontal=True)
-    mfiv_source = st.selectbox("Headline MFIV source", ("Raw strip", "SSVI", "Fengler"), index=0)
-    compare_surface_models = st.checkbox("Fit / compare SSVI + Fengler", value=False)
     target_days = st.number_input("Constant tenor (days)", min_value=7, max_value=180, value=30, step=1)
     dte_lo, dte_hi = st.slider("Option DTE range", min_value=1, max_value=365, value=(7, 180))
     max_expiries = st.number_input("Max expiries", min_value=2, max_value=40, value=16, step=1)
@@ -216,18 +273,63 @@ try:
             price_side=price_side,
         )
 
-        surface_results = {}
-        if compare_surface_models or mfiv_source != "Raw strip":
-            surface_results = build_surface_mfiv_comparison(
-                chain,
-                target_days=float(target_days),
-                dte_range=(float(dte_lo), float(dte_hi)),
-            )
 except Exception as exc:
     st.error(f"Could not build the snapshot: {exc}")
     if provider == "orats":
         st.caption("ORATS requires ORATS_API_TOKEN in the environment and the appropriate data entitlement.")
     st.stop()
+
+fit_lo, fit_hi = _surface_focus_dte_range(
+    chain,
+    target_days=float(target_days),
+    user_range=(float(dte_lo), float(dte_hi)),
+)
+surface_key = (
+    str(symbol), str(provider), str(snapshot.quote_time), float(target_days),
+    float(fit_lo), float(fit_hi), str(price_side),
+)
+confirmations = st.session_state.setdefault("surface_confirmations", {})
+surface_results = confirmations.get(surface_key, {})
+
+with st.sidebar:
+    st.divider()
+    st.header("Surface confirmation")
+    st.caption(
+        "Optional and expensive. Raw-strip MFIV remains the fast default; "
+        "SSVI/Fengler only run when you ask for confirmation."
+    )
+    run_surface_confirmation = st.button(
+        "Run surface confirmation",
+        use_container_width=True,
+        help="Fits only nearby expiries around the target tenor, then caches the result for this chain snapshot.",
+    )
+    if run_surface_confirmation:
+        try:
+            with st.spinner("Fitting SSVI + Fengler once for this chain snapshot…"):
+                surface_results = _build_surface_comparison_cached(
+                    chain, float(target_days), float(fit_lo), float(fit_hi)
+                )
+            confirmations[surface_key] = surface_results
+            st.session_state["surface_confirmations"] = confirmations
+        except Exception as exc:
+            st.warning(f"Surface confirmation failed: {exc}")
+            surface_results = {}
+
+    if surface_results:
+        st.success(f"Cached confirmation: {fit_lo:.1f}–{fit_hi:.1f} DTE")
+        source_options = ["Raw strip"] + [name for name in ("SSVI", "Fengler") if name in surface_results]
+    else:
+        st.caption(f"Not run for this snapshot. Planned fit window: {fit_lo:.1f}–{fit_hi:.1f} DTE.")
+        source_options = ["Raw strip"]
+
+    if st.session_state.get("mfiv_source") not in source_options:
+        st.session_state["mfiv_source"] = "Raw strip"
+    mfiv_source = st.selectbox(
+        "Headline MFIV source",
+        source_options,
+        key="mfiv_source",
+        help="SSVI/Fengler become selectable only after confirmation has been run for the current snapshot.",
+    )
 
 selected_name = mfiv_source
 selected_target = snapshot.target_mfiv
@@ -316,7 +418,11 @@ with surface_tab:
         "and then integrated with the same MFIV formula. This is a diagnostic comparison, not a model vote."
     )
     if not surface_results:
-        st.info("Enable **Fit / compare SSVI + Fengler** in the sidebar, or choose one as the headline MFIV source.")
+        st.info(
+            "Raw-strip MFIV is the fast default. Click **Run surface confirmation** in the sidebar only when "
+            "you want SSVI/Fengler as a quality-control check."
+        )
+        st.caption(f"The confirmation fit will focus on roughly {fit_lo:.1f}–{fit_hi:.1f} DTE instead of the full option range.")
     else:
         rows = [{
             "model": "Raw strip",
