@@ -21,6 +21,7 @@ __all__ = [
     "ProviderCapabilities",
     "OptionChainProvider",
     "YahooProvider",
+    "ORATSProvider",
     "available_providers",
     "fetch_chain",
     "get_provider",
@@ -57,6 +58,12 @@ class OptionChainProvider(Protocol):
         ...
 
 
+def _orats_provider_class():
+    from .orats import ORATSProvider
+    return ORATSProvider
+
+
+# Public alias is resolved lazily below to avoid import cycles in module loading.
 class YahooProvider:
     """Adapter wrapper around the existing ``volforge.data.yahoo`` module.
 
@@ -121,6 +128,7 @@ def _load_builtin_providers() -> None:
     if _BUILTINS_LOADED:
         return
     register_provider(YahooProvider(), replace=True)
+    register_provider(_orats_provider_class()(), replace=True)
     _BUILTINS_LOADED = True
 
 
@@ -180,3 +188,9 @@ def fetch_chain(
     )
     validate_chain(frame)
     return add_derived_columns(frame)
+
+
+def __getattr__(name: str):
+    if name == "ORATSProvider":
+        return _orats_provider_class()
+    raise AttributeError(name)
