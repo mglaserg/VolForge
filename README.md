@@ -336,10 +336,10 @@ current MFIV is compared with trailing integrated realized variance, while the
 true forward-VRP label remains MFIV today minus variance realized strictly in
 the future.
 
-Install the dashboard extra (and the data extra if you want Parquet inputs):
+Install the dashboard/data extras. Add `viz` for the interactive 3D surface view:
 
 ```bash
-pip install -e ".[dashboard,data]"
+pip install -e ".[dashboard,data,viz]"
 ```
 
 Run it from the repository root:
@@ -362,15 +362,38 @@ The dashboard currently provides:
 - 5/15-minute integrated realized variance including overnight gaps;
 - current MFIV-versus-trailing-RV comparison and RV 3d/9d/30d/60d/180d term structure;
 - option-chain quality diagnostics and the MFIV expiry-level calculation table;
-- a historical-feature tab that accepts compact `date,mfiv_var,trailing_rv_var`
-  files, with optional `forward_rv_var`, and calculates VRP z-scores,
-  percentiles, vol-of-vol, and the ex-post forward-VRP label without lookahead.
+- a historical-feature tab that can **save the current chain** and **build/update VRP history directly from the dashboard**, using current bars, a local intraday archive, or a saved daily integrated-variance file;
+- compact `date,mfiv_var,trailing_rv_var` history views, with optional `forward_rv_var`, VRP z-scores, percentiles, vol-of-vol, and the ex-post forward-VRP label without lookahead;
+- a dedicated **Surface Explorer** page with an interactive 3D fitted surface, ATM and MFIV term structures, a selectable smile/skew curve, and raw IV points.
 
 The built-in Yahoo intraday-bar option is intentionally labeled a **preview**:
 it is convenient for inspecting the live calculations, but the research model
 should ultimately be trained on a retained, research-grade high-frequency data
 history. The history tab also intentionally consumes derived local data rather
 than automatically making hundreds of paid historical option-chain API calls.
+
+### Surface Explorer
+
+Choose **Surface explorer** from the dashboard page selector. The page reuses
+VolForge's production `Surface` objects rather than a separate visualization-only
+interpolation. Select SVI, SSVI, eSSVI, or Fengler and inspect:
+
+- the fitted IV surface across DTE and log-moneyness;
+- the model ATM term structure alongside observed near-ATM points;
+- the raw-strip MFIV term structure;
+- one smile/skew curve at a selected tenor with the nearest observed expiry overlaid; and
+- the raw calibration IV points.
+
+Fengler keeps explicit `Fast`, `Expanded`, and `Full research` scopes so opening
+a visualization does not silently launch the most expensive fit.
+
+### Build / update VRP history from the dashboard
+
+Open **History / features → Build / update VRP history**. From there you can save
+the chain currently on screen, choose the realized-variance input, and rebuild
+the provider/symbol-partitioned research file. Rerunning the builder later fills
+forward-RV / forward-VRP labels once enough future realized data exists. The UI
+calls the same `volforge.history` functions as the CLI.
 
 ### VRP regime guide and surface confirmation
 

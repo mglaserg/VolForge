@@ -21,12 +21,21 @@ import streamlit as st
 from volforge.dashboard import (
     build_dashboard_snapshot,
     build_surface_mfiv_comparison,
+    build_surface_explorer,
     classify_vrp_candidate,
     classify_vrp_context,
     normalise_intraday_bars,
     prepare_vrp_history,
 )
 from volforge.data.provider import available_providers, fetch_chain
+from volforge.data.storage import (
+    list_chain_snapshots,
+    load_chain_snapshot,
+    save_chain_snapshot,
+    select_daily_snapshots,
+)
+from volforge.history import VRPHistoryConfig, build_vrp_history, load_daily_variance, save_vrp_history
+from volforge.realized import daily_integrated_variance
 
 
 st.set_page_config(page_title="VolForge · Forward VRP", page_icon="〽", layout="wide")
@@ -101,12 +110,6 @@ def _render_demo_page():
         "each model over the **same observed strike support** so differences reflect smoothing/model quality rather than a different wing domain."
     )
     st.caption("If a model is flagged unreliable, do not use its smoothed MFIV as confirmation. Treat the disagreement itself as a diagnostic.")
-
-
-page = st.sidebar.radio("Page", ("Forward VRP dashboard", "How to use"), index=0)
-if page == "How to use":
-    _render_demo_page()
-    st.stop()
 
 
 def _pct(x: float, digits: int = 1) -> str:
@@ -211,6 +214,35 @@ def _build_surface_comparison_cached(
     )
 
 
+@st.cache_data(show_spinner=False, max_entries=12)
+def _build_surface_explorer_cached(
+    chain: pd.DataFrame,
+    model: str,
+    dte_lo: float,
+    dte_hi: float,
+    tenor_count: int,
+    k_lo: float,
+    k_hi: float,
+    k_points: int,
+    fengler_mode: str,
+    fengler_max_maturities: int,
+    fengler_max_strikes: int,
+    fengler_calendar_grid: int,
+):
+    return build_surface_explorer(
+        chain,
+        model=model,
+        dte_range=(float(dte_lo), float(dte_hi)),
+        tenor_count=int(tenor_count),
+        k_range=(float(k_lo), float(k_hi)),
+        k_points=int(k_points),
+        fengler_mode=fengler_mode,
+        fengler_max_maturities=int(fengler_max_maturities),
+        fengler_max_strikes=(None if int(fengler_max_strikes) <= 0 else int(fengler_max_strikes)),
+        fengler_calendar_grid=int(fengler_calendar_grid),
+    )
+
+
 def _read_table_from_upload(uploaded) -> pd.DataFrame:
     name = uploaded.name.lower()
     payload = uploaded.getvalue()
@@ -230,6 +262,147 @@ def _read_table_from_path(path_text: str) -> pd.DataFrame:
     if path.suffix.lower() in {".parquet", ".pq"}:
         return pd.read_parquet(path)
     raise ValueError("local file must be CSV or Parquet")
+
+
+def _render_surface_explorer_page():
+    st.title("VolForge · Surface Explorer")
+    st.caption("Inspect the fitted volatility surface, ATM/MFIV term structures, and individual smile curves from one chain snapshot.")
+
+    with st.sidebar:
+        st.header("Surface Explorer")
+        sx_symbol = st.text_input("Symbol", "SPY", key="surface_symbol").strip().upper()
+        sx_provider = st.selectbox("Provider", available_providers(), key="surface_provider")
+        sx_source = st.radio("Chain source", ("Fetch current", "Latest saved snapshot", "Local snapshot path"), key="surface_source")
+        sx_chain_root = st.text_input("Chain archive root", "data/chains", key="surface_chain_root")
+        sx_local_path = ""
+        if sx_source == "Local snapshot path":
+            sx_local_path = st.text_input("chain.parquet path", "", key="surface_local_path")
+        sx_dte_lo, sx_dte_hi = st.slider("DTE range", 1, 365, (7, 180), key="surface_dte")
+        sx_max_exp = st.number_input("Max expiries when fetching", 2, 40, 16, key="surface_max_exp")
+        sx_model = st.selectbox("Surface model", ("SVI", "SSVI", "eSSVI", "Fengler"), index=0, key="surface_model")
+        sx_tenors = st.slider("Display tenor rows", 5, 24, 12, key="surface_tenors")
+        sx_k_lo, sx_k_hi = st.slider("Log-moneyness range", -0.60, 0.60, (-0.25, 0.25), step=0.01, key="surface_k_range")
+        sx_k_points = st.slider("Curve grid points", 17, 101, 41, step=2, key="surface_k_points")
+
+        sx_fengler_mode = "fast"
+        sx_fengler_mats, sx_fengler_strikes, sx_fengler_grid = 5, 60, 61
+        if sx_model == "Fengler":
+            scope = st.selectbox("Fengler scope", ("Fast", "Expanded", "Full research"), key="surface_fengler_scope")
+            if scope == "Expanded":
+                sx_fengler_mode, sx_fengler_mats, sx_fengler_strikes, sx_fengler_grid = "expanded", 9, 90, 101
+            elif scope == "Full research":
+                sx_fengler_mode, sx_fengler_mats, sx_fengler_strikes, sx_fengler_grid = "full", 999, 0, 181
+        sx_run = st.button("Load / fit surface", type="primary", use_container_width=True, key="surface_run")
+
+    if not sx_run and "surface_has_run" not in st.session_state:
+        st.info("Choose a chain source and model, then click **Load / fit surface**.")
+        return
+    if sx_run:
+        st.session_state["surface_has_run"] = True
+
+    try:
+        with st.spinner(f"Loading chain and fitting {sx_model}…"):
+            if sx_source == "Fetch current":
+                sx_chain = _fetch_chain_cached(sx_symbol, sx_provider, int(sx_max_exp), int(sx_dte_lo), int(sx_dte_hi))
+            elif sx_source == "Latest saved snapshot":
+                refs = list_chain_snapshots(sx_symbol, provider=sx_provider, root=sx_chain_root, include_legacy_yahoo=True)
+                refs = select_daily_snapshots(refs, policy="latest")
+                if not refs:
+                    raise FileNotFoundError(f"No saved {sx_provider} snapshots found for {sx_symbol} under {sx_chain_root}")
+                sx_chain = load_chain_snapshot(refs[-1])
+            else:
+                if not sx_local_path.strip():
+                    raise ValueError("Enter a local chain.parquet path")
+                sx_chain = load_chain_snapshot(Path(sx_local_path).expanduser())
+
+            explorer = _build_surface_explorer_cached(
+                sx_chain, sx_model, float(sx_dte_lo), float(sx_dte_hi), int(sx_tenors),
+                float(sx_k_lo), float(sx_k_hi), int(sx_k_points), sx_fengler_mode,
+                int(sx_fengler_mats), int(sx_fengler_strikes), int(sx_fengler_grid),
+            )
+    except Exception as exc:
+        st.error(f"Could not build surface: {exc}")
+        return
+
+    quote = pd.to_datetime(sx_chain["quote_time"], utc=True, errors="coerce").max().tz_convert("America/New_York")
+    st.caption(f"{sx_symbol} · {quote:%Y-%m-%d %H:%M %Z} · {sx_provider} · {explorer.model}")
+    a, b, c, d = st.columns(4)
+    a.metric("Model", explorer.model)
+    b.metric("Reliable", "Yes" if explorer.reliable else "Diagnostic")
+    c.metric("Fit RMSE", _pct(explorer.rmse_iv, 2))
+    d.metric("Surface tenors", str(len(explorer.surface.tenor_days)))
+    st.caption(explorer.detail)
+
+    surface_tab, term_tab, curve_tab, points_tab = st.tabs(("Surface", "Term structure", "Smile / curve", "Raw IV points"))
+
+    with surface_tab:
+        st.subheader(f"{explorer.model} implied-volatility surface")
+        try:
+            import plotly.graph_objects as go
+            fig = go.Figure(data=[go.Surface(
+                x=explorer.surface.k_grid,
+                y=explorer.surface.tenor_days,
+                z=100 * explorer.surface.iv,
+            )])
+            fig.update_layout(
+                scene={"xaxis_title": "Log-moneyness k", "yaxis_title": "DTE", "zaxis_title": "IV (%)"},
+                margin={"l": 0, "r": 0, "t": 25, "b": 0},
+                height=620,
+            )
+            st.plotly_chart(fig, use_container_width=True)
+        except ImportError:
+            st.info('Install the `viz` extra for the interactive 3D surface: `pip install -e ".[dashboard,data,viz]"`.')
+            surface_frame = explorer.surface.to_frame() * 100
+            st.dataframe(surface_frame.round(2), use_container_width=True)
+        st.caption("Rows are tenor/DTE; columns are log-moneyness. Values are implied volatility in percent.")
+
+    with term_tab:
+        st.subheader("ATM volatility term structure")
+        model_term = pd.DataFrame({
+            "dte": explorer.surface.tenor_days,
+            f"{explorer.model} ATM": 100 * explorer.surface.iv[:, int(np.argmin(np.abs(explorer.surface.k_grid)))],
+        }).set_index("dte")
+        raw_atm = explorer.raw_atm_term.set_index("dte")[["raw_atm_iv"]].rename(columns={"raw_atm_iv": "Observed near-ATM"}) * 100
+        atm_plot = model_term.join(raw_atm, how="outer").sort_index()
+        st.line_chart(atm_plot)
+        st.dataframe(atm_plot.round(2), use_container_width=True)
+
+        st.subheader("Model-free implied-volatility term structure")
+        mfiv = explorer.mfiv_curve.set_index("dte")[["mfiv"]].rename(columns={"mfiv": "Raw-strip MFIV"}) * 100
+        st.line_chart(mfiv)
+        st.dataframe(mfiv.round(2), use_container_width=True)
+        st.caption("ATM term structure describes the center of the fitted surface; MFIV integrates the full OTM strip and is the variance measure used by the VRP workflow.")
+
+    with curve_tab:
+        st.subheader("Smile / skew curve")
+        tenors = [float(x) for x in explorer.surface.tenor_days]
+        selected_tenor = st.selectbox("Display tenor", tenors, index=int(np.argmin(np.abs(np.asarray(tenors) - 30.0))), format_func=lambda x: f"{x:.1f} DTE")
+        i = int(np.argmin(np.abs(explorer.surface.tenor_days - float(selected_tenor))))
+        model_curve = pd.DataFrame({"k": explorer.surface.k_grid, explorer.model: 100 * explorer.surface.iv[i]}).set_index("k")
+        raw_dtes = explorer.raw_points["dte"].drop_duplicates().to_numpy(float)
+        nearest_raw = float(raw_dtes[np.argmin(np.abs(raw_dtes - float(selected_tenor)))])
+        raw_curve = explorer.raw_points[np.isclose(explorer.raw_points["dte"], nearest_raw)][["k", "iv"]].copy()
+        raw_curve["Observed IV"] = 100 * raw_curve.pop("iv")
+        raw_curve = raw_curve.set_index("k")
+        st.line_chart(model_curve.join(raw_curve, how="outer").sort_index())
+        st.caption(f"Observed points shown from the nearest actual expiry: {nearest_raw:.1f} DTE.")
+        curve_table = explorer.raw_points[np.isclose(explorer.raw_points["dte"], nearest_raw)][["strike", "k", "iv"]].copy()
+        curve_table["iv"] *= 100
+        st.dataframe(curve_table.rename(columns={"iv": "observed_iv_pct"}), use_container_width=True, hide_index=True)
+
+    with points_tab:
+        pts = explorer.raw_points.copy()
+        pts["iv"] *= 100
+        st.dataframe(pts.rename(columns={"iv": "iv_pct"}), use_container_width=True, hide_index=True)
+
+
+page = st.sidebar.radio("Page", ("Forward VRP dashboard", "Surface explorer", "How to use"), index=0)
+if page == "How to use":
+    _render_demo_page()
+    st.stop()
+if page == "Surface explorer":
+    _render_surface_explorer_page()
+    st.stop()
 
 
 st.title("VolForge · Forward VRP")
@@ -533,14 +706,106 @@ with surface_tab:
 with history_tab:
     st.subheader("Daily VRP history")
     st.write(
-        "Load a compact derived-history file instead of making the dashboard issue hundreds of historical "
-        "option-chain API calls. Required columns: `date`, `mfiv_var`, `trailing_rv_var`. Optional: "
-        "`forward_rv_var` for the ex-post forward VRP label."
+        "Build or update the compact research table from saved chain snapshots plus integrated realized variance. "
+        "The builder reads local data first; it does not issue hundreds of historical option API calls."
+    )
+
+    with st.expander("Build / update VRP history", expanded=False):
+        st.markdown("**1. Archive the current chain (optional)**")
+        hist_chain_root = st.text_input("Chain archive root", "data/chains", key="history_chain_root")
+        save_col, saved_info = st.columns([1, 2])
+        with save_col:
+            if st.button("Save current chain", use_container_width=True, key="history_save_chain"):
+                try:
+                    ref = save_chain_snapshot(chain, provider=provider, root=hist_chain_root)
+                    st.session_state["history_saved_chain"] = str(ref.path)
+                except Exception as exc:
+                    st.error(f"Could not save chain: {exc}")
+        with saved_info:
+            if st.session_state.get("history_saved_chain"):
+                st.success(f"Saved: {st.session_state['history_saved_chain']}")
+            else:
+                st.caption("The history builder only uses chain snapshots already saved under the archive root.")
+
+        st.markdown("**2. Choose realized-variance history**")
+        history_rv_source = st.radio(
+            "RV source",
+            ("Current dashboard bars", "Local intraday bars", "Daily integrated variance"),
+            horizontal=True,
+            key="history_rv_source",
+        )
+        history_rv_path = ""
+        if history_rv_source == "Local intraday bars":
+            history_rv_path = st.text_input(
+                "Intraday bars path", f"data/intraday/{symbol}.parquet", key="history_bars_path"
+            )
+            st.caption("CSV/Parquet with timestamp + close (or common equivalents).")
+        elif history_rv_source == "Daily integrated variance":
+            history_rv_path = st.text_input(
+                "Daily variance path", f"data/realized/{symbol}.parquet", key="history_daily_var_path"
+            )
+            st.caption("CSV/Parquet with date + integrated_variance.")
+        else:
+            st.caption("Uses the bars already loaded for the live dashboard. Useful for a quick update; long research history should come from your local archive.")
+
+        st.markdown("**3. Build / update**")
+        hc1, hc2, hc3 = st.columns(3)
+        with hc1:
+            history_policy = st.selectbox("Daily snapshot", ("latest", "earliest", "closest"), key="history_snapshot_policy")
+        with hc2:
+            history_target_time = st.text_input("Target time ET", "15:30", key="history_target_time", disabled=history_policy != "closest")
+        with hc3:
+            history_rv_asof = st.selectbox("RV as-of", ("previous_session", "same_session"), key="history_rv_asof")
+        history_output_root = st.text_input("Derived history root", "data/derived/vrp", key="history_output_root")
+
+        if st.button("Build / update VRP history", type="primary", use_container_width=True, key="history_build"):
+            try:
+                with st.spinner("Reading saved chains and rebuilding VRP history…"):
+                    if history_rv_source == "Current dashboard bars":
+                        daily_for_history = daily_integrated_variance(bars)
+                    elif history_rv_source == "Local intraday bars":
+                        hist_bars = normalise_intraday_bars(_read_table_from_path(history_rv_path))
+                        daily_for_history = daily_integrated_variance(hist_bars)
+                    else:
+                        daily_for_history = load_daily_variance(history_rv_path)
+
+                    hcfg = VRPHistoryConfig(
+                        target_days=float(target_days),
+                        price_side=price_side,
+                        rv_asof=history_rv_asof,
+                        snapshot_policy=history_policy,
+                        target_time=(history_target_time if history_policy == "closest" else None),
+                    )
+                    built_history = build_vrp_history(
+                        symbol,
+                        daily_for_history,
+                        provider=provider,
+                        chain_root=hist_chain_root,
+                        config=hcfg,
+                    )
+                    target_path = save_vrp_history(
+                        built_history, symbol=symbol, provider=provider, root=history_output_root
+                    )
+                st.session_state["vrp_history_path"] = str(target_path)
+                st.session_state["vrp_history_build_rows"] = int(len(built_history))
+                st.session_state["vrp_history_build_labels"] = int(built_history.get("forward_rv_var", pd.Series(dtype=float)).notna().sum())
+                st.success(
+                    f"Updated {len(built_history)} rows · "
+                    f"{st.session_state['vrp_history_build_labels']} forward labels · {target_path}"
+                )
+            except Exception as exc:
+                st.error(f"Could not build VRP history: {exc}")
+
+    st.write(
+        "Load the compact derived-history file below. Required columns: `date`, `mfiv_var`, `trailing_rv_var`. "
+        "Optional: `forward_rv_var` for the ex-post forward VRP label."
     )
     hist_upload = st.file_uploader("VRP history CSV / Parquet", type=["csv", "parquet", "pq"], key="vrp_history")
+    if "vrp_history_path" not in st.session_state:
+        st.session_state["vrp_history_path"] = f"data/derived/vrp/provider={provider}/symbol={symbol}/history.parquet"
     hist_path = st.text_input(
         "…or history path",
-        value=f"data/derived/vrp/provider={provider}/symbol={symbol}/history.parquet",
+        key="vrp_history_path",
     )
 
     hist_frame = None

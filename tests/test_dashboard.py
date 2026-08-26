@@ -156,3 +156,26 @@ def test_vrp_candidate_labels_post_shock_and_no_premium():
         mfiv_volatility=float(np.sqrt(low_var)),
     )
     assert low.label == "Not a VRP candidate"
+
+
+def test_surface_explorer_builds_svi_surface_term_structure_and_curve_data():
+    from volforge.dashboard import build_surface_explorer
+
+    c = _chain((20, 30, 40, 60), sigma=0.20)
+    c["volume"] = 100
+    c["open_interest"] = 100
+    view = build_surface_explorer(
+        c,
+        model="SVI",
+        dte_range=(7, 90),
+        tenor_count=6,
+        k_range=(-0.20, 0.20),
+        k_points=21,
+    )
+    assert view.model == "SVI"
+    assert view.surface.iv.shape[1] == 21
+    assert len(view.surface.tenor_days) >= 3
+    assert {"dte", "k", "strike", "iv"} <= set(view.raw_points.columns)
+    assert {"dte", "raw_atm_iv"} <= set(view.raw_atm_term.columns)
+    assert {"dte", "mfiv"} <= set(view.mfiv_curve.columns)
+    assert abs(float(np.nanmedian(view.surface.iv)) - 0.20) < 0.03

@@ -31,9 +31,11 @@ __all__ = [
     "VRPContext",
     "VRPCandidate",
     "SurfaceMFIVResult",
+    "SurfaceExplorerData",
     "classify_vrp_context",
     "classify_vrp_candidate",
     "build_surface_mfiv_comparison",
+    "build_surface_explorer",
 ]
 
 
@@ -302,6 +304,20 @@ class VRPCandidate:
     level: str
     explanation: str
     reasons: tuple[str, ...]
+
+
+@dataclass(frozen=True)
+class SurfaceExplorerData:
+    """One calibrated surface plus the raw observations used to interpret it."""
+
+    model: str
+    surface: object
+    raw_points: pd.DataFrame
+    raw_atm_term: pd.DataFrame
+    mfiv_curve: pd.DataFrame
+    reliable: bool
+    rmse_iv: float
+    detail: str
 
 
 @dataclass(frozen=True)
@@ -605,3 +621,188 @@ def build_surface_mfiv_comparison(
         )
 
     return out
+
+
+def build_surface_explorer(
+    chain: pd.DataFrame,
+    *,
+    model: str = "SVI",
+    dte_range: tuple[float, float] = (7.0, 180.0),
+    tenor_count: int = 12,
+    k_range: tuple[float, float] = (-0.25, 0.25),
+    k_points: int = 41,
+    fengler_mode: str = "fast",
+    fengler_max_maturities: int = 5,
+    fengler_max_strikes: int | None = 60,
+    fengler_calendar_grid: int = 61,
+    price_side: str = "mid",
+) -> SurfaceExplorerData:
+    """Build the fitted IV surface used by the dashboard Surface Explorer.
+
+    The function deliberately reuses VolForge's production surface objects.
+    Raw observations remain visible alongside the fit so a smooth model cannot
+    hide sparse/bad quotes.  SVI is the fast default; SSVI/eSSVI/Fengler are
+    optional global/arbitrage-aware alternatives.
+    """
+    from .data.clean import CleanConfig, clean_chain
+    from .data.pipeline import build_all_slices
+    from .svi import calibrate_svi
+    from .surface import build_surface
+    from .ssvi import calibrate_ssvi
+    from .essvi import calibrate_essvi
+    from .fengler import fit_fengler_surface, prepare_fengler_slices
+
+    name = str(model).strip()
+    key = name.lower()
+    aliases = {"svi": "SVI", "ssvi": "SSVI", "essvi": "eSSVI", "fengler": "Fengler"}
+    if key not in aliases:
+        raise ValueError("model must be one of SVI, SSVI, eSSVI, Fengler")
+    name = aliases[key]
+
+    clean, _ = clean_chain(
+        chain,
+        CleanConfig(dte_range=dte_range, require_activity=False),
+        verbose=False,
+    )
+    slices = build_all_slices(clean, verbose=False)
+    if len(slices) < 2:
+        raise ValueError("need at least two calibratable expiries for the surface explorer")
+
+    raw_rows = []
+    atm_rows = []
+    for slc in slices:
+        for k, strike, iv in zip(slc.k, slc.strikes, slc.iv):
+            raw_rows.append({
+                "expiry": slc.expiry,
+                "dte": float(slc.dte),
+                "k": float(k),
+                "strike": float(strike),
+                "iv": float(iv),
+            })
+        j = int(np.argmin(np.abs(slc.k)))
+        atm_rows.append({
+            "expiry": slc.expiry,
+            "dte": float(slc.dte),
+            "raw_atm_iv": float(slc.iv[j]),
+            "raw_atm_k": float(slc.k[j]),
+        })
+    raw_points = pd.DataFrame(raw_rows).sort_values(["dte", "k"]).reset_index(drop=True)
+    raw_atm = pd.DataFrame(atm_rows).sort_values("dte").reset_index(drop=True)
+
+    observed_dtes = np.array(sorted(float(s.dte) for s in slices), dtype=float)
+    lo_dte, hi_dte = observed_dtes.min(), observed_dtes.max()
+    n_tenor = max(3, int(tenor_count))
+    if len(observed_dtes) <= n_tenor:
+        tenors = observed_dtes
+    else:
+        tenors = np.linspace(lo_dte, hi_dte, n_tenor)
+    k_lo, k_hi = map(float, k_range)
+    if not np.isfinite(k_lo) or not np.isfinite(k_hi) or k_hi <= k_lo:
+        raise ValueError("k_range must be finite and increasing")
+    k_grid = np.linspace(k_lo, k_hi, max(9, int(k_points)))
+
+    pairs = [(s, calibrate_svi(s.k, s.w, s.T, weights=s.weights)) for s in slices]
+    reliable = False
+    rmse_iv = np.nan
+    detail = ""
+    trade_date = pd.to_datetime(clean["quote_time"], utc=True).max().date()
+    symbol = str(clean["symbol"].iloc[0])
+
+    if name == "SVI":
+        try:
+            surface = build_surface(
+                pairs, trade_date=trade_date, symbol=symbol, tenor_days=tenors,
+                k_grid=k_grid, reliable_only=True, repair=True,
+            )
+            used_reliable = True
+        except ValueError:
+            surface = build_surface(
+                pairs, trade_date=trade_date, symbol=symbol, tenor_days=tenors,
+                k_grid=k_grid, reliable_only=False, repair=True,
+            )
+            used_reliable = False
+        ok = [f for _, f in pairs if f.is_reliable]
+        reliable = bool(used_reliable and len(ok) >= 2 and surface.calendar_repair < 1e-5)
+        rmse_iv = float(np.mean([f.rmse_iv for _, f in pairs])) if pairs else np.nan
+        detail = (
+            f"{len(ok)}/{len(pairs)} reliable raw-SVI slices; "
+            f"calendar repair={surface.calendar_repair:.3g}"
+        )
+
+    elif name == "SSVI":
+        anchor_mode = "reliable raw-SVI anchors"
+        try:
+            fit = calibrate_ssvi(pairs, reliable_only=True)
+        except ValueError:
+            fit = calibrate_ssvi(pairs, reliable_only=False)
+            anchor_mode = "successful raw-SVI anchors (diagnostic fallback)"
+        surface = fit.to_surface(trade_date, symbol=symbol, tenor_days=tenors, k_grid=k_grid)
+        reliable = bool(fit.is_reliable and anchor_mode.startswith("reliable"))
+        rmse_iv = float(fit.rmse_iv)
+        detail = (
+            f"butterfly={fit.butterfly_free}, calendar={fit.calendar_free}, "
+            f"theta repair={fit.theta_repair_fraction:.2%}; {anchor_mode}"
+        )
+
+    elif name == "eSSVI":
+        anchor_mode = "reliable raw-SVI anchors"
+        try:
+            fit = calibrate_essvi(pairs, reliable_only=True, n_restarts=5)
+        except ValueError:
+            fit = calibrate_essvi(pairs, reliable_only=False, n_restarts=5)
+            anchor_mode = "successful raw-SVI anchors (diagnostic fallback)"
+        surface = fit.to_surface(trade_date, symbol=symbol, tenor_days=tenors, k_grid=k_grid)
+        reliable = bool(fit.is_reliable and anchor_mode.startswith("reliable"))
+        rmse_iv = float(fit.rmse_iv)
+        detail = (
+            f"butterfly={fit.butterfly_free}, calendar={fit.calendar_free}, "
+            f"rho0={fit.params.rho0:+.3f}, rho_m={fit.params.rho_m:+.3f}; {anchor_mode}"
+        )
+
+    else:
+        mode = str(fengler_mode).strip().lower()
+        if mode not in {"fast", "expanded", "full"}:
+            raise ValueError("fengler_mode must be 'fast', 'expanded', or 'full'")
+        f_inputs = slices if mode == "full" else prepare_fengler_slices(
+            slices,
+            target_days=30.0,
+            max_maturities=int(fengler_max_maturities),
+            max_strikes_per_slice=fengler_max_strikes,
+        )
+        fit = fit_fengler_surface(
+            f_inputs,
+            calendar_grid_size=int(fengler_calendar_grid),
+            solver="auto",
+            solver_tol=1e-9,
+        )
+        # Restrict the display tenor range to maturities Fengler actually fit.
+        f_dtes = np.array([float(x.dte) for x in fit.slices])
+        f_tenors = tenors[(tenors >= f_dtes.min()) & (tenors <= f_dtes.max())]
+        if len(f_tenors) < 3:
+            f_tenors = np.linspace(f_dtes.min(), f_dtes.max(), min(max(3, len(f_dtes)), n_tenor))
+        surface = fit.to_surface(trade_date, symbol=symbol, tenor_days=f_tenors, k_grid=k_grid)
+        reliable = bool(fit.is_reliable)
+        rmse_iv = float(fit.rmse_iv)
+        detail = (
+            f"strike-arb={fit.butterfly_free}, calendar={fit.calendar_free}; "
+            f"mode={mode}, solver={fit.solver}, {fit.elapsed_seconds:.2f}s"
+        )
+
+    raw_mfiv = mfiv_term_structure(clean, price_side=price_side)
+    mfiv_curve = pd.DataFrame([{
+        "expiry": x.expiry,
+        "dte": float(x.dte),
+        "mfiv": float(x.implied_volatility),
+        "implied_variance": float(x.implied_variance),
+    } for x in raw_mfiv]).sort_values("dte").reset_index(drop=True)
+
+    return SurfaceExplorerData(
+        model=name,
+        surface=surface,
+        raw_points=raw_points,
+        raw_atm_term=raw_atm,
+        mfiv_curve=mfiv_curve,
+        reliable=reliable,
+        rmse_iv=rmse_iv,
+        detail=detail,
+    )
