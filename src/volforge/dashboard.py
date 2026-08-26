@@ -29,8 +29,10 @@ __all__ = [
     "normalise_intraday_bars",
     "prepare_vrp_history",
     "VRPContext",
+    "VRPCandidate",
     "SurfaceMFIVResult",
     "classify_vrp_context",
+    "classify_vrp_candidate",
     "build_surface_mfiv_comparison",
 ]
 
@@ -288,6 +290,21 @@ class VRPContext:
 
 
 @dataclass(frozen=True)
+class VRPCandidate:
+    """Transparent research classification for a possible VRP setup.
+
+    This is deliberately a *candidate* label rather than a trade instruction.
+    It only summarizes the observable premium/regime state; position sizing,
+    tail risk, execution, and the future-RV forecasting layer remain separate.
+    """
+
+    label: str
+    level: str
+    explanation: str
+    reasons: tuple[str, ...]
+
+
+@dataclass(frozen=True)
 class SurfaceMFIVResult:
     name: str
     target: ConstantTenorMFIV
@@ -334,6 +351,95 @@ def classify_vrp_context(
     return VRPContext(state, explanation, current, recent_peak, cooling, premium)
 
 
+def classify_vrp_candidate(
+    snapshot: DashboardSnapshot,
+    context: VRPContext,
+    *,
+    mfiv_variance: float | None = None,
+    mfiv_volatility: float | None = None,
+) -> VRPCandidate:
+    """Classify the current setup as a VRP *research candidate*.
+
+    The rule is intentionally small and interpretable.  It does not attempt to
+    predict option P&L.  A positive implied-vs-trailing-RV spread is required;
+    the RV3/RV30 transition then determines whether the premium is merely
+    present, still forming during an active shock, or lingering after the shock
+    has cooled.
+    """
+    implied_var = (
+        snapshot.target_mfiv.implied_variance
+        if mfiv_variance is None
+        else float(mfiv_variance)
+    )
+    implied_vol = (
+        snapshot.target_mfiv.implied_volatility
+        if mfiv_volatility is None
+        else float(mfiv_volatility)
+    )
+    variance_spread = float(implied_var - snapshot.trailing_target_variance)
+    vol_spread = float(implied_vol - snapshot.trailing_target_volatility)
+
+    reasons: list[str] = []
+    if variance_spread > 0:
+        reasons.append("Implied variance is above trailing integrated realized variance.")
+    else:
+        reasons.append("Implied variance is not above trailing integrated realized variance.")
+
+    if context.cooling_from_shock:
+        reasons.append("RV3 has fallen below RV30 after a recent positive RV3−RV30 slope.")
+    elif np.isfinite(context.rv_slope) and context.rv_slope > 0:
+        reasons.append("RV3 is above RV30, so the realized-volatility shock is still active.")
+    elif np.isfinite(context.rv_slope) and context.rv_slope < 0:
+        reasons.append("RV3 is below RV30, indicating calmer very-short-horizon realized volatility.")
+
+    if variance_spread <= 0:
+        return VRPCandidate(
+            label="Not a VRP candidate",
+            level="none",
+            explanation=(
+                "The live implied-variance premium is not positive versus trailing integrated RV. "
+                "There may still be other option edges, but this is not a clean VRP candidate by the current screen."
+            ),
+            reasons=tuple(reasons),
+        )
+
+    if context.cooling_from_shock:
+        return VRPCandidate(
+            label="Post-shock VRP candidate",
+            level="strong",
+            explanation=(
+                "Realized volatility has cooled after a recent short-horizon spike while option-implied variance "
+                "still exceeds trailing realized variance. This is the lingering-premium pattern to research most closely."
+            ),
+            reasons=tuple(reasons),
+        )
+
+    if np.isfinite(context.rv_slope) and context.rv_slope > 0:
+        return VRPCandidate(
+            label="Developing VRP candidate",
+            level="watch",
+            explanation=(
+                "Premium is positive, but RV3 is still above RV30. The setup may be forming, yet the realized-volatility "
+                "shock is still active and deserves more caution than a post-shock state."
+            ),
+            reasons=tuple(reasons),
+        )
+
+    # A positive premium with a calm/flat short-horizon RV state deserves
+    # investigation, but without the recent shock -> cooling transition it is
+    # not promoted to the post-shock classification.
+    spread_text = f"{100 * vol_spread:+.1f} vol points" if np.isfinite(vol_spread) else "positive"
+    return VRPCandidate(
+        label="VRP candidate",
+        level="candidate",
+        explanation=(
+            f"Implied volatility is {spread_text} above trailing integrated RV. The premium is present, "
+            "but the stronger post-shock transition is not currently confirmed."
+        ),
+        reasons=tuple(reasons),
+    )
+
+
 def build_surface_mfiv_comparison(
     chain: pd.DataFrame,
     *,
@@ -341,10 +447,15 @@ def build_surface_mfiv_comparison(
     dte_range: tuple[float, float] = (7.0, 180.0),
     min_strikes: int = 8,
     fengler_lambda: float = 1e-5,
+    models: Iterable[str] = ("SSVI", "eSSVI", "Fengler"),
+    fengler_mode: str = "fast",
+    fengler_max_maturities: int = 5,
+    fengler_max_strikes: int | None = 60,
+    fengler_calendar_grid: int = 61,
 ) -> dict[str, SurfaceMFIVResult]:
-    """Fit SSVI and Fengler and integrate their smoothed option prices.
+    """Fit selected surface models and integrate their smoothed option prices.
 
-    Both models are integrated on each expiry's observed strike support, then
+    Models are integrated on each expiry's observed strike support, then
     converted to a constant tenor in total-variance time.  This makes their
     MFIV directly comparable with the raw-strip calculation.
     """
@@ -352,8 +463,17 @@ def build_surface_mfiv_comparison(
     from .data.pipeline import build_all_slices
     from .svi import calibrate_svi
     from .ssvi import calibrate_ssvi
+    from .essvi import calibrate_essvi
     from .fengler import fit_fengler_surface, prepare_fengler_slices
     from .mfiv import mfiv_from_model
+
+    requested = {str(x).strip().lower() for x in models}
+    valid = {"ssvi", "essvi", "fengler"}
+    unknown = requested - valid
+    if unknown:
+        raise ValueError(f"unknown surface model(s): {sorted(unknown)}")
+    if not requested:
+        return {}
 
     clean, _ = clean_chain(
         chain,
@@ -364,64 +484,9 @@ def build_surface_mfiv_comparison(
     if len(slices) < 3:
         raise ValueError("need at least three calibratable expiries for SSVI/Fengler")
 
-    pairs = [(s, calibrate_svi(s.k, s.w, s.T, weights=s.weights)) for s in slices]
-    ssvi_anchor_mode = "reliable raw-SVI anchors"
-    try:
-        ssvi = calibrate_ssvi(pairs, reliable_only=True)
-    except ValueError:
-        # Flat/synthetic or boundary-pinned raw-SVI slices can be successful yet
-        # fail the stricter reliability gate.  Permit a diagnostic fit, but mark
-        # it non-confirmatory in the result metadata.
-        ssvi = calibrate_ssvi(pairs, reliable_only=False)
-        ssvi_anchor_mode = "successful raw-SVI anchors (diagnostic fallback)"
-    ssvi_slices = []
-    for s in slices:
-        strikes = clean.loc[clean["expiry"] == s.expiry, "strike"].unique()
-        try:
-            ssvi_slices.append(mfiv_from_model(
-                expiry=s.expiry,
-                T=s.T,
-                forward_fit=s.forward_fit,
-                strikes=strikes,
-                implied_vol_fn=lambda k, T=s.T: ssvi.implied_vol(k, T),
-                label="ssvi",
-                min_strikes=min_strikes,
-            ))
-        except ValueError:
-            continue
-    ssvi_target = constant_tenor_mfiv(ssvi_slices, target_days)
-
-    fengler_inputs = prepare_fengler_slices(
-        slices,
-        target_days=target_days,
-        max_maturities=5,
-        max_strikes_per_slice=60,
-    )
-    fengler = fit_fengler_surface(
-        fengler_inputs,
-        smoothing_lambda=fengler_lambda,
-        calendar_grid_size=61,
-        solver="auto",
-        solver_tol=1e-9,
-    )
-    fengler_slices = []
-    originals = sorted(slices, key=lambda s: s.T)
-    for fit in fengler.slices:
-        s = min(originals, key=lambda candidate: abs(float(candidate.T) - float(fit.T)))
-        strikes = clean.loc[clean["expiry"] == s.expiry, "strike"].unique()
-        try:
-            fengler_slices.append(mfiv_from_model(
-                expiry=s.expiry,
-                T=s.T,
-                forward_fit=s.forward_fit,
-                strikes=strikes,
-                implied_vol_fn=lambda k, f=fit: f.implied_vol(k, allow_extrapolation=False),
-                label="fengler",
-                min_strikes=min_strikes,
-            ))
-        except ValueError:
-            continue
-    fengler_target = constant_tenor_mfiv(fengler_slices, target_days)
+    pairs = None
+    if requested & {"ssvi", "essvi"}:
+        pairs = [(s, calibrate_svi(s.k, s.w, s.T, weights=s.weights)) for s in slices]
 
     def frame(ss):
         return pd.DataFrame([{
@@ -431,18 +496,112 @@ def build_surface_mfiv_comparison(
             "n_strikes": x.n_strikes,
         } for x in ss]).sort_values("dte").reset_index(drop=True)
 
-    return {
-        "SSVI": SurfaceMFIVResult(
-            "SSVI", ssvi_target, frame(ssvi_slices),
+    out: dict[str, SurfaceMFIVResult] = {}
+
+    if "ssvi" in requested:
+        ssvi_anchor_mode = "reliable raw-SVI anchors"
+        try:
+            ssvi = calibrate_ssvi(pairs, reliable_only=True)
+        except ValueError:
+            ssvi = calibrate_ssvi(pairs, reliable_only=False)
+            ssvi_anchor_mode = "successful raw-SVI anchors (diagnostic fallback)"
+        ssvi_slices = []
+        for s in slices:
+            strikes = clean.loc[clean["expiry"] == s.expiry, "strike"].unique()
+            try:
+                ssvi_slices.append(mfiv_from_model(
+                    expiry=s.expiry,
+                    T=s.T,
+                    forward_fit=s.forward_fit,
+                    strikes=strikes,
+                    implied_vol_fn=lambda k, T=s.T: ssvi.implied_vol(k, T),
+                    label="ssvi",
+                    min_strikes=min_strikes,
+                ))
+            except ValueError:
+                continue
+        out["SSVI"] = SurfaceMFIVResult(
+            "SSVI", constant_tenor_mfiv(ssvi_slices, target_days), frame(ssvi_slices),
             bool(ssvi.is_reliable and ssvi_anchor_mode == "reliable raw-SVI anchors"),
             float(ssvi.rmse_iv),
-            f"butterfly={ssvi.butterfly_free}, calendar={ssvi.calendar_free}, theta repair={ssvi.theta_repair_fraction:.2%}; {ssvi_anchor_mode}",
-        ),
-        "Fengler": SurfaceMFIVResult(
-            "Fengler", fengler_target, frame(fengler_slices), bool(fengler.is_reliable),
-            float(fengler.rmse_iv),
+            f"butterfly={ssvi.butterfly_free}, calendar={ssvi.calendar_free}, "
+            f"theta repair={ssvi.theta_repair_fraction:.2%}; {ssvi_anchor_mode}",
+        )
+
+    if "essvi" in requested:
+        essvi_anchor_mode = "reliable raw-SVI anchors"
+        try:
+            essvi = calibrate_essvi(pairs, reliable_only=True, n_restarts=5)
+        except ValueError:
+            essvi = calibrate_essvi(pairs, reliable_only=False, n_restarts=5)
+            essvi_anchor_mode = "successful raw-SVI anchors (diagnostic fallback)"
+        essvi_slices = []
+        for s in slices:
+            strikes = clean.loc[clean["expiry"] == s.expiry, "strike"].unique()
+            try:
+                essvi_slices.append(mfiv_from_model(
+                    expiry=s.expiry,
+                    T=s.T,
+                    forward_fit=s.forward_fit,
+                    strikes=strikes,
+                    implied_vol_fn=lambda k, T=s.T: essvi.implied_vol(k, T),
+                    label="essvi",
+                    min_strikes=min_strikes,
+                ))
+            except ValueError:
+                continue
+        out["eSSVI"] = SurfaceMFIVResult(
+            "eSSVI", constant_tenor_mfiv(essvi_slices, target_days), frame(essvi_slices),
+            bool(essvi.is_reliable and essvi_anchor_mode == "reliable raw-SVI anchors"),
+            float(essvi.rmse_iv),
+            f"butterfly={essvi.butterfly_free}, calendar={essvi.calendar_free}, "
+            f"theta repair={essvi.theta_repair_fraction:.2%}, "
+            f"rho0={essvi.params.rho0:+.3f}, rho_m={essvi.params.rho_m:+.3f}; {essvi_anchor_mode}",
+        )
+
+    if "fengler" in requested:
+        mode = str(fengler_mode).strip().lower()
+        if mode not in {"fast", "expanded", "full"}:
+            raise ValueError("fengler_mode must be 'fast', 'expanded', or 'full'")
+        if mode == "full":
+            fengler_inputs = slices
+        else:
+            fengler_inputs = prepare_fengler_slices(
+                slices,
+                target_days=target_days,
+                max_maturities=int(fengler_max_maturities),
+                max_strikes_per_slice=fengler_max_strikes,
+            )
+        fengler = fit_fengler_surface(
+            fengler_inputs,
+            smoothing_lambda=fengler_lambda,
+            calendar_grid_size=int(fengler_calendar_grid),
+            solver="auto",
+            solver_tol=1e-9,
+        )
+        fengler_slices = []
+        originals = sorted(slices, key=lambda s: s.T)
+        for fit in fengler.slices:
+            s = min(originals, key=lambda candidate: abs(float(candidate.T) - float(fit.T)))
+            strikes = clean.loc[clean["expiry"] == s.expiry, "strike"].unique()
+            try:
+                fengler_slices.append(mfiv_from_model(
+                    expiry=s.expiry,
+                    T=s.T,
+                    forward_fit=s.forward_fit,
+                    strikes=strikes,
+                    implied_vol_fn=lambda k, f=fit: f.implied_vol(k, allow_extrapolation=False),
+                    label="fengler",
+                    min_strikes=min_strikes,
+                ))
+            except ValueError:
+                continue
+        out["Fengler"] = SurfaceMFIVResult(
+            "Fengler", constant_tenor_mfiv(fengler_slices, target_days), frame(fengler_slices),
+            bool(fengler.is_reliable), float(fengler.rmse_iv),
             f"strike-arb={fengler.butterfly_free}, calendar={fengler.calendar_free}; "
-            f"solver={fengler.solver}, {fengler.elapsed_seconds:.2f}s, "
-            f"{len(fengler.slices)} local maturities",
-        ),
-    }
+            f"mode={mode}, solver={fengler.solver}, {fengler.elapsed_seconds:.2f}s, "
+            f"{len(fengler.slices)} maturities, grid={int(fengler_calendar_grid)}",
+        )
+
+    return out

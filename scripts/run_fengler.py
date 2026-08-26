@@ -70,16 +70,16 @@ def main():
     ap.add_argument("--dte", nargs=2, type=float, default=[7.0, 120.0])
     ap.add_argument("--lambda", dest="smoothing_lambda", type=float, default=1e-5,
                     help="natural-spline roughness penalty (default: 1e-5)")
-    ap.add_argument("--calendar-grid", type=int, default=181,
-                    help="dense forward-moneyness points used for pairwise no-crossing")
-    ap.add_argument("--mode", choices=("full", "fast"), default="full",
-                    help="full research fit or compact target-tenor confirmation")
+    ap.add_argument("--calendar-grid", type=int, default=None,
+                    help="calendar no-crossing grid; defaults by mode (fast=61, expanded=101, full=181)")
+    ap.add_argument("--mode", choices=("full", "expanded", "fast"), default="full",
+                    help="full research fit, broader confirmation, or compact target-tenor confirmation")
     ap.add_argument("--target-dte", type=float, default=30.0,
                     help="target tenor used by --mode fast (default: 30)")
-    ap.add_argument("--max-maturities", type=int, default=5,
-                    help="maximum maturities in --mode fast (default: 5)")
-    ap.add_argument("--max-strikes", type=int, default=60,
-                    help="representative strikes per maturity in --mode fast (default: 60)")
+    ap.add_argument("--max-maturities", type=int, default=None,
+                    help="override maturity cap (mode defaults: fast=5, expanded=9)")
+    ap.add_argument("--max-strikes", type=int, default=None,
+                    help="override representative strikes per maturity (mode defaults: fast=60, expanded=90)")
     ap.add_argument("--solver", choices=("auto", "osqp", "slsqp"), default="auto",
                     help="QP solver; auto prefers OSQP and falls back to reduced SLSQP")
     ap.add_argument("--solver-tol", type=float, default=1e-9,
@@ -101,17 +101,32 @@ def main():
         raise ValueError("need at least three calibratable slices")
 
     if args.mode == "fast":
+        max_maturities = 5 if args.max_maturities is None else int(args.max_maturities)
+        max_strikes = 60 if args.max_strikes is None else int(args.max_strikes)
+        calendar_grid = 61 if args.calendar_grid is None else int(args.calendar_grid)
         slices = prepare_fengler_slices(
             slices,
             target_days=args.target_dte,
-            max_maturities=args.max_maturities,
-            max_strikes_per_slice=args.max_strikes,
+            max_maturities=max_maturities,
+            max_strikes_per_slice=max_strikes,
         )
+    elif args.mode == "expanded":
+        max_maturities = 9 if args.max_maturities is None else int(args.max_maturities)
+        max_strikes = 90 if args.max_strikes is None else int(args.max_strikes)
+        calendar_grid = 101 if args.calendar_grid is None else int(args.calendar_grid)
+        slices = prepare_fengler_slices(
+            slices,
+            target_days=args.target_dte,
+            max_maturities=max_maturities,
+            max_strikes_per_slice=max_strikes,
+        )
+    else:
+        calendar_grid = 181 if args.calendar_grid is None else int(args.calendar_grid)
 
     print(
         f"\nFengler fit plan: mode={args.mode}, solver={args.solver}, "
         f"maturities={len(slices)}, strikes={[int(s.n) for s in slices]}, "
-        f"calendar_grid={args.calendar_grid}"
+        f"calendar_grid={calendar_grid}"
     )
 
     def progress(event):
@@ -134,7 +149,7 @@ def main():
     fit = fit_fengler_surface(
         slices,
         smoothing_lambda=args.smoothing_lambda,
-        calendar_grid_size=args.calendar_grid,
+        calendar_grid_size=calendar_grid,
         solver=args.solver,
         solver_tol=args.solver_tol,
         maxiter=args.maxiter,

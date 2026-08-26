@@ -21,6 +21,7 @@ import streamlit as st
 from volforge.dashboard import (
     build_dashboard_snapshot,
     build_surface_mfiv_comparison,
+    classify_vrp_candidate,
     classify_vrp_context,
     normalise_intraday_bars,
     prepare_vrp_history,
@@ -75,6 +76,14 @@ def _render_demo_page():
 """
     )
 
+    st.subheader("What the VRP-candidate label means")
+    st.write(
+        "VolForge now promotes the regime summary into a simple research classification: **Not a VRP candidate**, "
+        "**Developing VRP candidate**, **VRP candidate**, or **Post-shock VRP candidate**. The label is intentionally "
+        "not a trade instruction. It requires a positive implied-vs-trailing-RV premium and then uses the RV3/RV30 "
+        "state to explain whether the shock is still active, simply calm, or cooling after a recent spike."
+    )
+
     st.subheader("RV3 / RV30 context matrix")
     matrix = pd.DataFrame([
         {"RV state": "RV3 > RV30", "MFIV state": "High", "Read": "Shock active; premium may be forming, but realized risk is still hot."},
@@ -84,10 +93,11 @@ def _render_demo_page():
     ])
     st.dataframe(matrix, use_container_width=True, hide_index=True)
 
-    st.subheader("Why compare Raw, SSVI, and Fengler?")
+    st.subheader("Why compare Raw, SSVI, eSSVI, and Fengler?")
     st.write(
         "Raw-strip MFIV uses the observed option quotes directly. SSVI gives a global parametric, static-arbitrage-aware "
-        "surface; Fengler smooths in option-price space under convexity/monotonicity/calendar constraints. VolForge integrates "
+        "surface; eSSVI lets correlation vary with maturity; Fengler smooths in option-price space under "
+        "convexity/monotonicity/calendar constraints. VolForge integrates "
         "each model over the **same observed strike support** so differences reflect smoothing/model quality rather than a different wing domain."
     )
     st.caption("If a model is flagged unreliable, do not use its smoothed MFIV as confirmation. Treat the disagreement itself as a diagnostic.")
@@ -182,12 +192,22 @@ def _build_surface_comparison_cached(
     target_days: float,
     fit_lo: float,
     fit_hi: float,
+    models: tuple[str, ...],
+    fengler_mode: str,
+    fengler_max_maturities: int,
+    fengler_max_strikes: int,
+    fengler_calendar_grid: int,
 ):
-    """Cache expensive SSVI/Fengler fits by option-chain snapshot."""
+    """Cache expensive surface fits by option-chain snapshot/configuration."""
     return build_surface_mfiv_comparison(
         chain,
         target_days=float(target_days),
         dte_range=(float(fit_lo), float(fit_hi)),
+        models=models,
+        fengler_mode=fengler_mode,
+        fengler_max_maturities=int(fengler_max_maturities),
+        fengler_max_strikes=(None if int(fengler_max_strikes) <= 0 else int(fengler_max_strikes)),
+        fengler_calendar_grid=int(fengler_calendar_grid),
     )
 
 
@@ -279,35 +299,73 @@ except Exception as exc:
         st.caption("ORATS requires ORATS_API_TOKEN in the environment and the appropriate data entitlement.")
     st.stop()
 
-fit_lo, fit_hi = _surface_focus_dte_range(
+local_fit_lo, local_fit_hi = _surface_focus_dte_range(
     chain,
     target_days=float(target_days),
     user_range=(float(dte_lo), float(dte_hi)),
 )
-surface_key = (
-    str(symbol), str(provider), str(snapshot.quote_time), float(target_days),
-    float(fit_lo), float(fit_hi), str(price_side),
-)
-confirmations = st.session_state.setdefault("surface_confirmations", {})
-surface_results = confirmations.get(surface_key, {})
 
 with st.sidebar:
     st.divider()
     st.header("Surface confirmation")
     st.caption(
         "Optional and expensive. Raw-strip MFIV remains the fast default; "
-        "SSVI/Fengler only run when you ask for confirmation."
+        "SSVI/eSSVI/Fengler only run when you ask for confirmation."
     )
+    confirmation_models = tuple(st.multiselect(
+        "Models",
+        ("SSVI", "eSSVI", "Fengler"),
+        default=("SSVI", "eSSVI"),
+        help="Fengler is opt-in because it is the most expensive real-chain confirmation.",
+    ))
+    fengler_scope = "Fast"
+    if "Fengler" in confirmation_models:
+        fengler_scope = st.selectbox(
+            "Fengler scope",
+            ("Fast", "Expanded", "Full research"),
+            index=0,
+            help=(
+                "Fast: ~5 maturities × 60 strikes near target tenor. Expanded: ~9 maturities × 90 strikes "
+                "across the selected DTE range. Full research: all cleaned maturities/strikes; can take much longer."
+            ),
+        )
+
+    if fengler_scope == "Fast":
+        fit_lo, fit_hi = local_fit_lo, local_fit_hi
+        fengler_mode = "fast"
+        fengler_max_maturities, fengler_max_strikes, fengler_calendar_grid = 5, 60, 61
+    elif fengler_scope == "Expanded":
+        fit_lo, fit_hi = float(dte_lo), float(dte_hi)
+        fengler_mode = "expanded"
+        fengler_max_maturities, fengler_max_strikes, fengler_calendar_grid = 9, 90, 101
+    else:
+        fit_lo, fit_hi = float(dte_lo), float(dte_hi)
+        fengler_mode = "full"
+        fengler_max_maturities, fengler_max_strikes, fengler_calendar_grid = 999, 0, 181
+
+    surface_key = (
+        str(symbol), str(provider), str(snapshot.quote_time), float(target_days),
+        float(fit_lo), float(fit_hi), str(price_side), tuple(confirmation_models),
+        str(fengler_mode), int(fengler_max_maturities), int(fengler_max_strikes),
+        int(fengler_calendar_grid),
+    )
+    confirmations = st.session_state.setdefault("surface_confirmations", {})
+    surface_results = confirmations.get(surface_key, {})
+
     run_surface_confirmation = st.button(
-        "Run surface confirmation",
+        "Run selected confirmation",
         use_container_width=True,
-        help="Fits only nearby expiries around the target tenor, then caches the result for this chain snapshot.",
+        disabled=not confirmation_models,
+        help="Runs only the selected models and caches the result for this exact chain snapshot/configuration.",
     )
     if run_surface_confirmation:
         try:
-            with st.spinner("Fitting SSVI + Fengler once for this chain snapshot…"):
+            model_text = " + ".join(confirmation_models)
+            with st.spinner(f"Fitting {model_text} once for this chain snapshot…"):
                 surface_results = _build_surface_comparison_cached(
-                    chain, float(target_days), float(fit_lo), float(fit_hi)
+                    chain, float(target_days), float(fit_lo), float(fit_hi),
+                    tuple(confirmation_models), str(fengler_mode),
+                    int(fengler_max_maturities), int(fengler_max_strikes), int(fengler_calendar_grid),
                 )
             confirmations[surface_key] = surface_results
             st.session_state["surface_confirmations"] = confirmations
@@ -316,10 +374,13 @@ with st.sidebar:
             surface_results = {}
 
     if surface_results:
-        st.success(f"Cached confirmation: {fit_lo:.1f}–{fit_hi:.1f} DTE")
-        source_options = ["Raw strip"] + [name for name in ("SSVI", "Fengler") if name in surface_results]
+        scope_note = f" · Fengler {fengler_scope.lower()}" if "Fengler" in confirmation_models else ""
+        st.success(f"Cached confirmation: {fit_lo:.1f}–{fit_hi:.1f} DTE{scope_note}")
+        source_options = ["Raw strip"] + [name for name in ("SSVI", "eSSVI", "Fengler") if name in surface_results]
     else:
-        st.caption(f"Not run for this snapshot. Planned fit window: {fit_lo:.1f}–{fit_hi:.1f} DTE.")
+        st.caption(
+            f"Not run for this configuration. Planned fit window: {fit_lo:.1f}–{fit_hi:.1f} DTE."
+        )
         source_options = ["Raw strip"]
 
     if st.session_state.get("mfiv_source") not in source_options:
@@ -328,7 +389,7 @@ with st.sidebar:
         "Headline MFIV source",
         source_options,
         key="mfiv_source",
-        help="SSVI/Fengler become selectable only after confirmation has been run for the current snapshot.",
+        help="SSVI/eSSVI/Fengler become selectable only after that model has been run for the current snapshot.",
     )
 
 selected_name = mfiv_source
@@ -346,6 +407,12 @@ if mfiv_source != "Raw strip":
 selected_vrp_variance = float(selected_target.implied_variance - snapshot.trailing_target_variance)
 selected_vol_spread = float(selected_target.implied_volatility - snapshot.trailing_target_volatility)
 context = classify_vrp_context(snapshot, mfiv_variance=selected_target.implied_variance)
+candidate = classify_vrp_candidate(
+    snapshot,
+    context,
+    mfiv_variance=selected_target.implied_variance,
+    mfiv_volatility=selected_target.implied_volatility,
+)
 
 quote_local = snapshot.quote_time.tz_convert("America/New_York")
 st.caption(
@@ -363,7 +430,18 @@ rv_30 = snapshot.realized_curve.loc[snapshot.realized_curve["days"] == 30, "real
 rv_slope = float(rv_3.iloc[0] - rv_30.iloc[0]) if len(rv_3) and len(rv_30) else np.nan
 c5.metric("RV 3d − 30d", _pct(rv_slope))
 
-st.subheader(context.state)
+if candidate.level == "strong":
+    st.success(f"**{candidate.label}** — {candidate.explanation}")
+elif candidate.level in {"candidate", "watch"}:
+    st.info(f"**{candidate.label}** — {candidate.explanation}")
+else:
+    st.warning(f"**{candidate.label}** — {candidate.explanation}")
+with st.expander("Why VolForge assigned this candidate label"):
+    for reason in candidate.reasons:
+        st.write(f"• {reason}")
+    st.caption("Candidate ≠ trade instruction. Surface quality, tail risk, execution and forward-RV forecasting remain separate checks.")
+
+st.subheader(f"Regime: {context.state}")
 st.write(context.explanation)
 ctx1, ctx2, ctx3 = st.columns(3)
 ctx1.metric("Current RV3 − RV30", _pct(context.rv_slope))
@@ -414,15 +492,15 @@ with current_tab:
 with surface_tab:
     st.subheader("Raw strip vs surface-smoothed MFIV")
     st.write(
-        "SSVI and Fengler are fit to the cleaned current chain, repriced on the same observed strike support, "
+        "SSVI, eSSVI and Fengler are fit to the cleaned current chain, repriced on the same observed strike support, "
         "and then integrated with the same MFIV formula. This is a diagnostic comparison, not a model vote."
     )
     if not surface_results:
         st.info(
-            "Raw-strip MFIV is the fast default. Click **Run surface confirmation** in the sidebar only when "
-            "you want SSVI/Fengler as a quality-control check."
+            "Raw-strip MFIV is the fast default. Choose models and click **Run selected confirmation** in the sidebar only when "
+            "you want SSVI/eSSVI/Fengler as a quality-control check."
         )
-        st.caption(f"The confirmation fit will focus on roughly {fit_lo:.1f}–{fit_hi:.1f} DTE instead of the full option range.")
+        st.caption(f"Current confirmation window: {fit_lo:.1f}–{fit_hi:.1f} DTE.")
     else:
         rows = [{
             "model": "Raw strip",
@@ -460,7 +538,10 @@ with history_tab:
         "`forward_rv_var` for the ex-post forward VRP label."
     )
     hist_upload = st.file_uploader("VRP history CSV / Parquet", type=["csv", "parquet", "pq"], key="vrp_history")
-    hist_path = st.text_input("…or history path", value=f"data/vrp/{symbol}.csv")
+    hist_path = st.text_input(
+        "…or history path",
+        value=f"data/derived/vrp/provider={provider}/symbol={symbol}/history.parquet",
+    )
 
     hist_frame = None
     try:
@@ -472,7 +553,7 @@ with history_tab:
         st.error(f"Could not load VRP history: {exc}")
 
     if hist_frame is None:
-        st.info("No derived VRP history loaded yet. The upcoming batch-history builder will write this format.")
+        st.info("No derived VRP history loaded yet. Run `scripts/build_vrp_history.py` after capturing chains and realized-vol data.")
     else:
         try:
             enriched = prepare_vrp_history(hist_frame)

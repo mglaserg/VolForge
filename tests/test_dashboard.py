@@ -96,13 +96,63 @@ def test_classify_vrp_context_identifies_post_shock_cooling():
     assert ctx.premium_positive
 
 
-def test_surface_mfiv_comparison_builds_ssvi_and_fengler():
+def test_surface_mfiv_comparison_builds_ssvi_essvi_and_fengler():
     from volforge.dashboard import build_surface_mfiv_comparison
 
     c = _chain((20, 30, 40, 60), sigma=0.20)
     c["volume"] = 100
     c["open_interest"] = 100
     results = build_surface_mfiv_comparison(c, target_days=30, dte_range=(7, 90))
-    assert {"SSVI", "Fengler"} == set(results)
+    assert {"SSVI", "eSSVI", "Fengler"} == set(results)
     assert abs(results["SSVI"].target.implied_volatility - 0.20) < 0.03
+    assert abs(results["eSSVI"].target.implied_volatility - 0.20) < 0.03
     assert abs(results["Fengler"].target.implied_volatility - 0.20) < 0.03
+
+
+def test_surface_mfiv_comparison_can_run_selected_models_only():
+    from volforge.dashboard import build_surface_mfiv_comparison
+
+    c = _chain((20, 30, 40, 60), sigma=0.20)
+    c["volume"] = 100
+    c["open_interest"] = 100
+    results = build_surface_mfiv_comparison(
+        c,
+        target_days=30,
+        dte_range=(7, 90),
+        models=("eSSVI",),
+    )
+    assert set(results) == {"eSSVI"}
+    assert abs(results["eSSVI"].target.implied_volatility - 0.20) < 0.03
+
+
+def test_vrp_candidate_labels_post_shock_and_no_premium():
+    from dataclasses import replace
+    from volforge.dashboard import classify_vrp_candidate, classify_vrp_context
+
+    snap = build_dashboard_snapshot(_chain(), _bars(), target_days=30, min_mfiv_strikes=20)
+    hist = snap.realized_history.copy()
+    hist.loc[hist.index[-3], "rv_3"] = hist.loc[hist.index[-3], "rv_30"] + 0.10
+    hist.loc[hist.index[-1], "rv_3"] = max(hist.loc[hist.index[-1], "rv_30"] - 0.05, 0.001)
+    snap = replace(snap, realized_history=hist)
+
+    implied_var = snap.trailing_target_variance + 0.01
+    implied_vol = float(np.sqrt(implied_var))
+    ctx = classify_vrp_context(snap, mfiv_variance=implied_var, lookback=5)
+    candidate = classify_vrp_candidate(
+        snap,
+        ctx,
+        mfiv_variance=implied_var,
+        mfiv_volatility=implied_vol,
+    )
+    assert candidate.label == "Post-shock VRP candidate"
+    assert candidate.level == "strong"
+
+    low_var = max(snap.trailing_target_variance - 0.001, 1e-8)
+    low_ctx = classify_vrp_context(snap, mfiv_variance=low_var, lookback=5)
+    low = classify_vrp_candidate(
+        snap,
+        low_ctx,
+        mfiv_variance=low_var,
+        mfiv_volatility=float(np.sqrt(low_var)),
+    )
+    assert low.label == "Not a VRP candidate"
