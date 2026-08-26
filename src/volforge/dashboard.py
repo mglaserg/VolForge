@@ -352,7 +352,7 @@ def build_surface_mfiv_comparison(
     from .data.pipeline import build_all_slices
     from .svi import calibrate_svi
     from .ssvi import calibrate_ssvi
-    from .fengler import fit_fengler_surface
+    from .fengler import fit_fengler_surface, prepare_fengler_slices
     from .mfiv import mfiv_from_model
 
     clean, _ = clean_chain(
@@ -391,10 +391,23 @@ def build_surface_mfiv_comparison(
             continue
     ssvi_target = constant_tenor_mfiv(ssvi_slices, target_days)
 
-    fengler = fit_fengler_surface(slices, smoothing_lambda=fengler_lambda)
+    fengler_inputs = prepare_fengler_slices(
+        slices,
+        target_days=target_days,
+        max_maturities=5,
+        max_strikes_per_slice=60,
+    )
+    fengler = fit_fengler_surface(
+        fengler_inputs,
+        smoothing_lambda=fengler_lambda,
+        calendar_grid_size=61,
+        solver="auto",
+        solver_tol=1e-9,
+    )
     fengler_slices = []
     originals = sorted(slices, key=lambda s: s.T)
-    for fit, s in zip(fengler.slices, originals):
+    for fit in fengler.slices:
+        s = min(originals, key=lambda candidate: abs(float(candidate.T) - float(fit.T)))
         strikes = clean.loc[clean["expiry"] == s.expiry, "strike"].unique()
         try:
             fengler_slices.append(mfiv_from_model(
@@ -428,6 +441,8 @@ def build_surface_mfiv_comparison(
         "Fengler": SurfaceMFIVResult(
             "Fengler", fengler_target, frame(fengler_slices), bool(fengler.is_reliable),
             float(fengler.rmse_iv),
-            f"strike-arb={fengler.butterfly_free}, calendar={fengler.calendar_free}",
+            f"strike-arb={fengler.butterfly_free}, calendar={fengler.calendar_free}; "
+            f"solver={fengler.solver}, {fengler.elapsed_seconds:.2f}s, "
+            f"{len(fengler.slices)} local maturities",
         ),
     }

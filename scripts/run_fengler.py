@@ -18,10 +18,11 @@ from __future__ import annotations
 
 import argparse
 from pathlib import Path
+from time import perf_counter
 
 import pandas as pd
 
-from volforge import VolDB, fit_fengler_surface
+from volforge import VolDB, fit_fengler_surface, prepare_fengler_slices
 from volforge.data.clean import CleanConfig, clean_chain
 from volforge.data.pipeline import build_all_slices
 
@@ -46,6 +47,8 @@ def _summary(fit):
             "right_slope": s.right_slope,
             "strike_arb": s.strike_arb_free,
             "calendar": s.calendar_free,
+            "solver": s.solver,
+            "seconds": s.solve_time,
         })
     df = pd.DataFrame(rows)
     print("\nFengler slice summary")
@@ -55,6 +58,7 @@ def _summary(fit):
         "min_gamma": lambda x: f"{x:10.3g}",
         "left_slope": lambda x: f"{x:10.4f}",
         "right_slope": lambda x: f"{x:11.4f}",
+        "seconds": lambda x: f"{x:7.3f}",
     }))
 
 
@@ -68,6 +72,22 @@ def main():
                     help="natural-spline roughness penalty (default: 1e-5)")
     ap.add_argument("--calendar-grid", type=int, default=181,
                     help="dense forward-moneyness points used for pairwise no-crossing")
+    ap.add_argument("--mode", choices=("full", "fast"), default="full",
+                    help="full research fit or compact target-tenor confirmation")
+    ap.add_argument("--target-dte", type=float, default=30.0,
+                    help="target tenor used by --mode fast (default: 30)")
+    ap.add_argument("--max-maturities", type=int, default=5,
+                    help="maximum maturities in --mode fast (default: 5)")
+    ap.add_argument("--max-strikes", type=int, default=60,
+                    help="representative strikes per maturity in --mode fast (default: 60)")
+    ap.add_argument("--solver", choices=("auto", "osqp", "slsqp"), default="auto",
+                    help="QP solver; auto prefers OSQP and falls back to reduced SLSQP")
+    ap.add_argument("--solver-tol", type=float, default=1e-9,
+                    help="numerical solver tolerance (default: 1e-9)")
+    ap.add_argument("--maxiter", type=int, default=2500,
+                    help="maximum solver iterations per maturity")
+    ap.add_argument("--quiet-progress", action="store_true",
+                    help="suppress per-maturity timing output")
     ap.add_argument("--db", default=None)
     ap.add_argument("--plot", action="store_true")
     ap.add_argument("--save-plots", default=None, metavar="DIR")
@@ -80,16 +100,52 @@ def main():
     if len(slices) < 3:
         raise ValueError("need at least three calibratable slices")
 
+    if args.mode == "fast":
+        slices = prepare_fengler_slices(
+            slices,
+            target_days=args.target_dte,
+            max_maturities=args.max_maturities,
+            max_strikes_per_slice=args.max_strikes,
+        )
+
+    print(
+        f"\nFengler fit plan: mode={args.mode}, solver={args.solver}, "
+        f"maturities={len(slices)}, strikes={[int(s.n) for s in slices]}, "
+        f"calendar_grid={args.calendar_grid}"
+    )
+
+    def progress(event):
+        if args.quiet_progress:
+            return
+        if event["event"] == "start_slice":
+            print(
+                f"  fitting {event['dte']:6.1f} DTE · {event['n']:3d} strikes · "
+                f"{event['calendar_points']:3d} calendar constraints ...",
+                flush=True,
+            )
+        else:
+            print(
+                f"    -> {event['solver']} {event['seconds']:.3f}s "
+                f"success={event['success']}",
+                flush=True,
+            )
+
+    started = perf_counter()
     fit = fit_fengler_surface(
         slices,
         smoothing_lambda=args.smoothing_lambda,
         calendar_grid_size=args.calendar_grid,
+        solver=args.solver,
+        solver_tol=args.solver_tol,
+        maxiter=args.maxiter,
+        progress=progress,
     )
     _summary(fit)
     print(
         f"\nFengler: RMSE={fit.rmse_iv*100:.3f}vp  "
         f"strike-arbitrage-free={fit.butterfly_free}  "
-        f"calendar-free={fit.calendar_free}  reliable={fit.is_reliable}"
+        f"calendar-free={fit.calendar_free}  reliable={fit.is_reliable}  "
+        f"solver={fit.solver}  elapsed={perf_counter()-started:.3f}s"
     )
 
     surface = fit.to_surface(date, args.symbol)

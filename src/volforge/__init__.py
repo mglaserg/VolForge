@@ -27,7 +27,7 @@ from .essvi import (
 )
 from .fengler import (
     FenglerSliceFit, FenglerSurfaceFit, spline_qr_matrices, natural_spline_basis,
-    fit_fengler_slice, fit_fengler_surface, calibrate_fengler,
+    fit_fengler_slice, fit_fengler_surface, prepare_fengler_slices, calibrate_fengler,
 )
 from .diagnostics import ResidualReport, residual_report
 from .surface import Surface, build_surface, repair_calendar, surface_panel, \
@@ -58,7 +58,7 @@ __all__ = [
     "is_essvi_calendar_free", "is_essvi_butterfly_free",
     "calibrate_essvi", "fit_essvi_surface",
     "FenglerSliceFit", "FenglerSurfaceFit", "spline_qr_matrices",
-    "natural_spline_basis", "fit_fengler_slice", "fit_fengler_surface",
+    "natural_spline_basis", "fit_fengler_slice", "fit_fengler_surface", "prepare_fengler_slices",
     "calibrate_fengler",
     "ResidualReport", "residual_report",
     "Surface", "build_surface", "repair_calendar", "surface_panel",
