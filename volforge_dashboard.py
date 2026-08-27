@@ -36,6 +36,10 @@ from volforge.data.storage import (
 )
 from volforge.history import VRPHistoryConfig, build_vrp_history, load_daily_variance, save_vrp_history
 from volforge.realized import daily_integrated_variance
+from volforge.delta_surface import (
+    build_delta_surface, constant_tenor_delta_slice, delta_lump_scores,
+    delta_ratio_term_structure,
+)
 
 
 st.set_page_config(page_title="VolForge · Forward VRP", page_icon="〽", layout="wide")
@@ -215,6 +219,24 @@ def _build_surface_comparison_cached(
 
 
 @st.cache_data(show_spinner=False, max_entries=12)
+def _build_delta_surface_cached(
+    chain: pd.DataFrame,
+    dte_lo: float,
+    dte_hi: float,
+    target_days: float,
+):
+    surface = build_delta_surface(
+        chain,
+        dte_range=(float(dte_lo), float(dte_hi)),
+        require_activity=False,
+    )
+    target = constant_tenor_delta_slice(surface, float(target_days))
+    ratios = delta_ratio_term_structure(surface)
+    lumps = delta_lump_scores(surface)
+    return surface, target, ratios, lumps
+
+
+@st.cache_data(show_spinner=False, max_entries=12)
 def _build_surface_explorer_cached(
     chain: pd.DataFrame,
     model: str,
@@ -283,6 +305,10 @@ def _render_surface_explorer_page():
         sx_tenors = st.slider("Display tenor rows", 5, 24, 12, key="surface_tenors")
         sx_k_lo, sx_k_hi = st.slider("Log-moneyness range", -0.60, 0.60, (-0.25, 0.25), step=0.01, key="surface_k_range")
         sx_k_points = st.slider("Curve grid points", 17, 101, 41, step=2, key="surface_k_points")
+        sx_delta_target = st.number_input(
+            "Delta-surface constant tenor", 7, 180, 30, step=1, key="surface_delta_target",
+            help="The RW-style delta smile is interpolated in total-variance time at this maturity.",
+        )
 
         sx_fengler_mode = "fast"
         sx_fengler_mats, sx_fengler_strikes, sx_fengler_grid = 5, 60, 61
@@ -320,6 +346,9 @@ def _render_surface_explorer_page():
                 float(sx_k_lo), float(sx_k_hi), int(sx_k_points), sx_fengler_mode,
                 int(sx_fengler_mats), int(sx_fengler_strikes), int(sx_fengler_grid),
             )
+            delta_surface, delta_target, delta_ratios, delta_lumps = _build_delta_surface_cached(
+                sx_chain, float(sx_dte_lo), float(sx_dte_hi), float(sx_delta_target)
+            )
     except Exception as exc:
         st.error(f"Could not build surface: {exc}")
         return
@@ -333,7 +362,9 @@ def _render_surface_explorer_page():
     d.metric("Surface tenors", str(len(explorer.surface.tenor_days)))
     st.caption(explorer.detail)
 
-    surface_tab, term_tab, curve_tab, points_tab = st.tabs(("Surface", "Term structure", "Smile / curve", "Raw IV points"))
+    surface_tab, term_tab, curve_tab, delta_tab, ratio_tab, points_tab = st.tabs((
+        "Surface", "Term structure", "Smile / curve", "Delta surface", "Delta ratios", "Raw IV points"
+    ))
 
     with surface_tab:
         st.subheader(f"{explorer.model} implied-volatility surface")
@@ -389,6 +420,66 @@ def _render_surface_explorer_page():
         curve_table = explorer.raw_points[np.isclose(explorer.raw_points["dte"], nearest_raw)][["strike", "k", "iv"]].copy()
         curve_table["iv"] *= 100
         st.dataframe(curve_table.rename(columns={"iv": "observed_iv_pct"}), use_container_width=True, hide_index=True)
+
+    with delta_tab:
+        st.subheader("Delta volatility surface")
+        st.write(
+            "Model-light view: VolForge computes its own IVs and spot deltas, interpolates to standard "
+            "10Δ / 15Δ / 25Δ put and call buckets, and keeps ATM as the center. No SVI-family fit is required."
+        )
+        delta_frame = delta_surface.display_frame() * 100
+        pretty = {
+            "iv_10p": "10Δ put", "iv_15p": "15Δ put", "iv_25p": "25Δ put",
+            "atm_iv": "ATM", "iv_25c": "25Δ call", "iv_15c": "15Δ call", "iv_10c": "10Δ call",
+        }
+        shown_delta = delta_frame.rename(columns=pretty)
+        try:
+            import plotly.graph_objects as go
+            fig = go.Figure(data=go.Heatmap(
+                x=list(shown_delta.columns),
+                y=[float(x) for x in shown_delta.index],
+                z=shown_delta.to_numpy(float),
+                colorbar={"title": "IV (%)"},
+            ))
+            fig.update_layout(xaxis_title="Delta bucket", yaxis_title="DTE", height=520, margin={"l": 0, "r": 0, "t": 25, "b": 0})
+            st.plotly_chart(fig, use_container_width=True)
+        except ImportError:
+            st.dataframe(shown_delta.round(2), use_container_width=True)
+
+        target_rows = []
+        for key, label in pretty.items():
+            value = float(delta_target.get(key, np.nan))
+            ratio_key = key.replace("iv_", "delta_ratio_") if key != "atm_iv" else None
+            target_rows.append({
+                "bucket": label,
+                "iv_pct": 100 * value if np.isfinite(value) else np.nan,
+                "ratio_to_atm": float(delta_target.get(ratio_key, np.nan)) if ratio_key else 1.0,
+            })
+        st.markdown(f"**{float(sx_delta_target):.0f}-day constant-maturity delta smile**")
+        st.dataframe(pd.DataFrame(target_rows), use_container_width=True, hide_index=True)
+        st.caption("Maturity interpolation is linear in total variance (IV² × time), not directly in IV.")
+
+    with ratio_tab:
+        st.subheader("Delta ratios · the volatility compass")
+        ratio_cols = [c for c in delta_ratios.columns if c.startswith("delta_ratio_")]
+        if ratio_cols:
+            plot = delta_ratios.set_index("dte")[ratio_cols].rename(columns={
+                "delta_ratio_10p": "10Δ put / ATM",
+                "delta_ratio_15p": "15Δ put / ATM",
+                "delta_ratio_25p": "25Δ put / ATM",
+                "delta_ratio_25c": "25Δ call / ATM",
+                "delta_ratio_15c": "15Δ call / ATM",
+                "delta_ratio_10c": "10Δ call / ATM",
+            })
+            st.line_chart(plot)
+            st.dataframe(delta_ratios.round(4), use_container_width=True, hide_index=True)
+
+        st.markdown("**Local term-structure lumps**")
+        st.write(
+            "Each interior expiry is compared with the straight line through its immediate neighbors. "
+            "Large residuals flag a local shape dislocation; historical z-scores are tracked separately in VRP history."
+        )
+        st.dataframe(delta_lumps.round(4), use_container_width=True, hide_index=True)
 
     with points_tab:
         pts = explorer.raw_points.copy()
@@ -843,6 +934,38 @@ with history_tab:
             with h4:
                 st.markdown("**Vol-of-vol**")
                 st.line_chart(enriched[["vol_of_vol"]])
+
+            delta_ratio_cols = [
+                c for c in (
+                    "delta_ratio_10p", "delta_ratio_15p", "delta_ratio_25p",
+                    "delta_ratio_25c", "delta_ratio_15c", "delta_ratio_10c",
+                ) if c in enriched
+            ]
+            if delta_ratio_cols:
+                st.markdown("### Delta-ratio history")
+                st.line_chart(enriched[delta_ratio_cols])
+                z_cols = [f"{c}_z" for c in delta_ratio_cols if f"{c}_z" in enriched]
+                if z_cols:
+                    st.markdown("**Delta-ratio historical z-scores**")
+                    st.line_chart(enriched[z_cols])
+
+            decomp_cols = [
+                c for c in (
+                    "surface_parallel_shift", "surface_put_skew_change", "surface_call_skew_change",
+                    "surface_downside_convexity_change", "surface_upside_convexity_change",
+                ) if c in enriched
+            ]
+            if decomp_cols:
+                st.markdown("### Delta-surface change decomposition")
+                st.line_chart(100 * enriched[decomp_cols])
+                latest = enriched[decomp_cols].dropna(how="all").tail(1)
+                if not latest.empty:
+                    latest_display = (100 * latest.T).rename(columns={latest.index[0]: "latest_change_vol_pts"})
+                    st.dataframe(latest_display, use_container_width=True)
+                st.caption(
+                    "Observable delta-space decomposition: ATM parallel shift, 25Δ put/call skew changes, and wing convexity changes. "
+                    "This is not presented as an exact Vanna-Volga replication."
+                )
 
             if "forward_vrp" in enriched:
                 st.markdown("**Ex-post forward VRP label**")

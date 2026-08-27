@@ -33,6 +33,10 @@ from .diagnostics import ResidualReport, residual_report
 from .surface import Surface, build_surface, repair_calendar, surface_panel, \
     DEFAULT_TENORS, DEFAULT_K_GRID
 from .features import surface_features, feature_panel, standardize
+from .delta_surface import (
+    DeltaVolSurface, build_delta_surface, constant_tenor_delta_slice,
+    delta_ratio_term_structure, delta_lump_scores, delta_surface_change_features,
+)
 from .pca import PCAModel, fit_surface_pca, reconstruct, pca_residuals
 from .signals import (
     residual_signal, zscore_series, forward_convergence, bucket_by_signal,
@@ -64,6 +68,8 @@ __all__ = [
     "Surface", "build_surface", "repair_calendar", "surface_panel",
     "DEFAULT_TENORS", "DEFAULT_K_GRID",
     "surface_features", "feature_panel", "standardize",
+    "DeltaVolSurface", "build_delta_surface", "constant_tenor_delta_slice",
+    "delta_ratio_term_structure", "delta_lump_scores", "delta_surface_change_features",
     "PCAModel", "fit_surface_pca", "reconstruct", "pca_residuals",
     "residual_signal", "zscore_series", "forward_convergence",
     "bucket_by_signal", "mean_reversion_test", "SignalReport",

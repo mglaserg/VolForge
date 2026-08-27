@@ -63,4 +63,7 @@ Consistency of snapshot time matters more than accumulating arbitrary snapshots.
 
 Option chains are expensive and should be treated as immutable source data.
 Derived MFIV/RV/VRP tables are cheap and disposable: they can always be rebuilt
-when VolForge's calculations improve.
+when VolForge's calculations improve. `history.parquet` also carries the compact
+delta-surface research features (10Δ/15Δ/25Δ bucket IVs, delta ratios, historical
+z-scores/percentiles, local lump diagnostics, and ATM/skew/convexity changes), so
+those features never require storing another large market-data archive.

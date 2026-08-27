@@ -269,7 +269,14 @@ def prepare_vrp_history(
         z_window=z_window,
         min_periods=min_periods,
     )
-    out = df.join(features.drop(columns=["mfiv_var", "trailing_rv_var"]), how="left")
+    # Saved history files produced by ``build_vrp_history`` already contain
+    # these derived columns.  Recompute them for display so the dashboard uses
+    # the current feature definitions, but replace any persisted values rather
+    # than joining duplicate column names (which makes repeated builds fail).
+    out = df.copy()
+    for col in features.columns:
+        if col not in {"mfiv_var", "trailing_rv_var"}:
+            out[col] = features[col]
     out["mfiv_vol"] = integrated_volatility(out["mfiv_var"])
     out["trailing_rv_vol"] = integrated_volatility(out["trailing_rv_var"])
     out["vol_spread"] = out["mfiv_vol"] - out["trailing_rv_vol"]

@@ -80,6 +80,20 @@ def test_prepare_vrp_history_adds_no_lookahead_features_and_forward_label():
     assert np.isclose(out["forward_vrp"].iloc[-1], mfiv.iloc[-1] - (rv.iloc[-1] + 0.002))
 
 
+def test_prepare_vrp_history_is_idempotent_with_persisted_feature_columns():
+    dates = pd.date_range("2025-01-01", periods=80, freq="B")
+    hist = pd.DataFrame({
+        "date": dates,
+        "mfiv_var": np.linspace(0.03, 0.06, len(dates)),
+        "trailing_rv_var": np.linspace(0.025, 0.04, len(dates)),
+    })
+    once = prepare_vrp_history(hist, z_window=20, min_periods=5).reset_index()
+    twice = prepare_vrp_history(once, z_window=20, min_periods=5)
+
+    assert {"vrp", "vrp_z", "vrp_percentile", "mfiv_z", "mfiv_percentile"} <= set(twice.columns)
+    assert np.allclose(twice["vrp"], twice["mfiv_var"] - twice["trailing_rv_var"])
+
+
 def test_classify_vrp_context_identifies_post_shock_cooling():
     from dataclasses import replace
     from volforge.dashboard import classify_vrp_context

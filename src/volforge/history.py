@@ -17,7 +17,14 @@ import pandas as pd
 from .data.storage import list_chain_snapshots, load_chain_snapshot, select_daily_snapshots
 from .mfiv import constant_tenor_mfiv, mfiv_term_structure
 from .realized import forward_integrated_variance, integrated_volatility, rolling_integrated_variance
-from .vrp import forward_vrp_label, realized_term_structure, vol_of_vol, vrp_features
+from .vrp import (
+    forward_vrp_label, realized_term_structure, rolling_percentile, rolling_zscore,
+    vol_of_vol, vrp_features,
+)
+from .delta_surface import (
+    DEFAULT_DELTAS, build_delta_surface, constant_tenor_delta_slice,
+    delta_lump_scores, delta_surface_change_features,
+)
 
 __all__ = [
     "VRPHistoryConfig",
@@ -42,6 +49,8 @@ class VRPHistoryConfig:
     min_periods: int | None = None
     snapshot_policy: str = "latest"
     target_time: str | None = None
+    delta_deltas: tuple[float, ...] = DEFAULT_DELTAS
+    delta_dte_range: tuple[float, float] = (7.0, 180.0)
 
 
 def _prepare_daily(series: pd.Series) -> pd.Series:
@@ -110,6 +119,33 @@ def build_vrp_history(
                 row[f"mfiv_vol_{tenor}"] = np.nan
         target_col = f"mfiv_var_{int(cfg.target_days)}"
         row["mfiv_var"] = row.get(target_col, np.nan)
+
+        # Simple RW-style delta surface features.  These are intentionally
+        # independent of SVI/SSVI/eSSVI/Fengler so the research table retains a
+        # robust observable feature family even when no calibrated model is run.
+        try:
+            delta_surface = build_delta_surface(
+                chain,
+                deltas=cfg.delta_deltas,
+                dte_range=cfg.delta_dte_range,
+                require_activity=False,
+            )
+            delta_target = constant_tenor_delta_slice(delta_surface, cfg.target_days)
+            for col, value in delta_target.items():
+                if col != "target_days":
+                    row[col] = float(value) if np.isfinite(value) else np.nan
+
+            lumps = delta_lump_scores(delta_surface)
+            if not lumps.empty:
+                nearest = lumps.iloc[int(np.argmin(np.abs(lumps["dte"].to_numpy(float) - cfg.target_days)))]
+                for col in [c for c in lumps.columns if c.startswith("delta_lump_")]:
+                    value = pd.to_numeric(nearest[col], errors="coerce")
+                    row[col] = float(value) if np.isfinite(value) else np.nan
+        except ValueError:
+            # A sparse chain can still support MFIV without reaching every
+            # standard delta bucket.  Preserve the day rather than failing the
+            # entire historical build.
+            pass
         rows.append(row)
 
     out = pd.DataFrame(rows).sort_values("date").drop_duplicates("date", keep="last")
@@ -147,6 +183,20 @@ def build_vrp_history(
         out[col] = features[col]
     out["forward_vrp"] = forward_vrp_label(out["mfiv_var"], out["forward_rv_var"])
     out["vol_of_vol"] = vol_of_vol(out["mfiv_var"], window=20)
+
+    # Historical anomaly scores for the simple delta-ratio features.  These use
+    # strictly prior observations, matching the VRP z-score convention.
+    ratio_cols = [c for c in out.columns if c.startswith("delta_ratio_")]
+    for col in ratio_cols:
+        out[f"{col}_z"] = rolling_zscore(out[col].rename(col), cfg.z_window, cfg.min_periods)
+        out[f"{col}_percentile"] = rolling_percentile(out[col].rename(col), cfg.z_window, cfg.min_periods)
+
+    # Daily linear decomposition of the constant-tenor delta surface: ATM
+    # parallel shift, put/call skew changes and wing convexity changes.
+    if "atm_iv" in out:
+        changes = delta_surface_change_features(out)
+        for col in changes.columns:
+            out[col] = changes[col]
 
     if "rv_slope_3_30" in out:
         out["rv_slope_3_30_delta1"] = out["rv_slope_3_30"].diff()

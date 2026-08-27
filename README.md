@@ -173,6 +173,7 @@ src/volforge/
 ├── diagnostics.py     residuals measured in half-spread units
 ├── surface.py         all expiries -> fixed grid, calendar repair
 ├── features.py        ATM, skew, curvature, wing asymmetry, term structure
+├── delta_surface.py   10Δ/15Δ/25Δ surface, ratios, lumps, surface-change features
 ├── pca.py             PCA on surface changes, spot-neutralised
 ├── signals.py         z-scores, convergence tests, bucket analysis
 ├── database.py        SQLite persistence, upsert on natural keys
@@ -364,7 +365,8 @@ The dashboard currently provides:
 - option-chain quality diagnostics and the MFIV expiry-level calculation table;
 - a historical-feature tab that can **save the current chain** and **build/update VRP history directly from the dashboard**, using current bars, a local intraday archive, or a saved daily integrated-variance file;
 - compact `date,mfiv_var,trailing_rv_var` history views, with optional `forward_rv_var`, VRP z-scores, percentiles, vol-of-vol, and the ex-post forward-VRP label without lookahead;
-- a dedicated **Surface Explorer** page with an interactive 3D fitted surface, ATM and MFIV term structures, a selectable smile/skew curve, and raw IV points.
+- RW-style **delta ratios** at 10Δ/15Δ/25Δ puts and calls, historical z-scores/percentiles, local term-structure lump diagnostics, and a transparent ATM/skew/convexity change decomposition;
+- a dedicated **Surface Explorer** page with an interactive 3D fitted surface, ATM and MFIV term structures, a selectable smile/skew curve, a model-light delta-volatility surface, delta-ratio term structure, and raw IV points.
 
 The built-in Yahoo intraday-bar option is intentionally labeled a **preview**:
 it is convenient for inspecting the live calculations, but the research model
@@ -381,11 +383,38 @@ interpolation. Select SVI, SSVI, eSSVI, or Fengler and inspect:
 - the fitted IV surface across DTE and log-moneyness;
 - the model ATM term structure alongside observed near-ATM points;
 - the raw-strip MFIV term structure;
-- one smile/skew curve at a selected tenor with the nearest observed expiry overlaid; and
+- one smile/skew curve at a selected tenor with the nearest observed expiry overlaid;
+- a non-parametric delta surface at 10Δ/15Δ/25Δ put/call buckets plus ATM;
+- delta-ratio term structures and local "lump" residuals; and
 - the raw calibration IV points.
 
 Fengler keeps explicit `Fast`, `Expanded`, and `Full research` scopes so opening
 a visualization does not silently launch the most expensive fit.
+
+### Delta surface and delta-ratio features
+
+VolForge also builds a deliberately simple delta-space representation directly
+from its own parity/IV pipeline. It does **not** require SVI/SSVI/eSSVI/Fengler:
+
+```python
+from volforge import build_delta_surface, constant_tenor_delta_slice
+
+delta_surface = build_delta_surface(chain, dte_range=(7, 180))
+d30 = constant_tenor_delta_slice(delta_surface, 30)
+print(d30[["atm_iv", "delta_ratio_25p", "delta_ratio_25c"]])
+```
+
+For each actual expiry, VolForge interpolates IV to standard 10Δ, 15Δ and 25Δ
+put/call buckets and ATM. Across maturity, it interpolates **total variance**
+(`IV² × time`) at fixed delta rather than interpolating IV directly. Delta ratios
+are then simply `IV(delta) / IV(ATM)`. The historical VRP builder persists the
+raw bucket IVs, ratios, prior-only z-scores/percentiles, local term-structure lump
+residuals, and daily ATM/skew/convexity change features.
+
+The intended research split is: simple observable features are the primary
+signal inputs; SSVI/eSSVI/Fengler remain smoothing, arbitrage and data-quality
+confirmation tools. A later walk-forward forecasting layer can compare the
+simple feature family against calibrated-surface enrichments out of sample.
 
 ### Build / update VRP history from the dashboard
 
@@ -408,8 +437,8 @@ have been positive and implied variance must still exceed trailing integrated
 RV.  This captures the cooling-after-shock pattern discussed in the VRP
 research notes.
 
-The sidebar also supports headline MFIV from **Raw strip**, **SSVI**, or
-**Fengler**.  SSVI/Fengler values are produced by fitting the current cleaned
+The sidebar also supports headline MFIV from **Raw strip**, **SSVI**, **eSSVI**, or
+**Fengler**.  SSVI/eSSVI/Fengler values are produced by fitting the current cleaned
 chain, repricing on each expiry's observed strike support, and integrating those
 smoothed option prices with the same model-free variance formula.  The
 **Surface models** tab compares the resulting constant-tenor MFIV values,

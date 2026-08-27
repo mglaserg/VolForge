@@ -71,8 +71,14 @@ def test_history_builder_reads_saved_chains_and_adds_forward_labels(tmp_path, mo
     hist = build_vrp_history("SPY", daily, provider="yahoo", chain_root=chain_root, config=cfg)
 
     assert len(hist) == 3
-    assert {"mfiv_var", "trailing_rv_var", "forward_rv_var", "forward_vrp", "rv_slope_3_30"} <= set(hist.columns)
+    assert {
+        "mfiv_var", "trailing_rv_var", "forward_rv_var", "forward_vrp", "rv_slope_3_30",
+        "atm_iv", "delta_ratio_25p", "delta_ratio_25c",
+        "surface_parallel_shift", "surface_put_skew_change", "surface_downside_convexity_change",
+    } <= set(hist.columns)
     assert hist["mfiv_var"].notna().all()
+    assert hist["delta_ratio_25p"].notna().all()
+    assert np.allclose(hist["delta_ratio_25p"], 1.0, atol=0.03)
     assert hist["forward_rv_var"].notna().all()
     assert np.allclose(hist["mfiv_var"], 0.20**2, atol=0.004)
 
