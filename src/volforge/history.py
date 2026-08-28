@@ -156,14 +156,21 @@ def build_vrp_history(
     # existing dashboard convention for RV3/RV9/RV30.
     rv_term = realized_term_structure(daily, windows=cfg.rv_windows, basis=cfg.rv_term_basis)
     target_trailing = rolling_integrated_variance(daily, int(cfg.target_days), basis=cfg.target_rv_basis)
+    daily_known = daily.copy()
     if cfg.rv_asof == "previous_session":
         rv_term = rv_term.shift(1)
         target_trailing = target_trailing.shift(1)
+        daily_known = daily_known.shift(1)
     rv_term = _reindex_daily(rv_term, dates)
     target_trailing = _reindex_daily(target_trailing, dates)
+    daily_known = _reindex_daily(daily_known, dates)
 
     for col in rv_term.columns:
         out[col] = rv_term[col]
+    # Unannualized daily realized measure known at the option snapshot.  This is
+    # retained specifically for HEAVY-RM forecasting; rolling RV features below
+    # remain annualized for direct comparison with MFIV.
+    out["daily_rm"] = daily_known
     out["trailing_rv_var"] = target_trailing
     out["trailing_rv_vol"] = integrated_volatility(out["trailing_rv_var"])
 

@@ -20,7 +20,6 @@ import streamlit as st
 
 from volforge.dashboard import (
     build_dashboard_snapshot,
-    build_surface_mfiv_comparison,
     build_surface_explorer,
     classify_vrp_candidate,
     classify_vrp_context,
@@ -41,6 +40,7 @@ from volforge.delta_surface import (
     delta_ratio_term_structure,
 )
 from volforge.vix_curve import load_vix_curve_history
+from volforge.forecasting import latest_model_forecasts, walk_forward_forecasts, forecast_metrics
 
 
 st.set_page_config(page_title="VolForge · Forward VRP", page_icon="〽", layout="wide")
@@ -85,7 +85,7 @@ def _render_demo_page():
 2. **Stretch:** With history loaded, is VRP unusually high by z-score/percentile?
 3. **Regime:** Is RV3 above RV30 (shock active), falling through RV30 (cooling), or simply calm?
 4. **Persistence:** Did RV3 recently spike above RV30 before falling below it? That transition is more informative than either sign alone.
-5. **Surface quality:** Compare raw-strip MFIV with SSVI and Fengler. Small differences are reassuring; large differences tell you to inspect quotes/surface fit before trusting the VRP reading.
+5. **Surface quality (optional):** If a candidate deserves deeper inspection, open **Advanced Surface Diagnostics** and compare the raw strip with SVI/SSVI/eSSVI/Fengler. The calibrated models no longer gate the primary VRP workflow.
 6. **No automatic trade:** A strong context still needs portfolio/tail-risk rules and, later, the forward-RV model.
 """
     )
@@ -107,12 +107,11 @@ def _render_demo_page():
     ])
     st.dataframe(matrix, use_container_width=True, hide_index=True)
 
-    st.subheader("Why compare Raw, SSVI, eSSVI, and Fengler?")
+    st.subheader("Where the calibrated surfaces fit now")
     st.write(
-        "Raw-strip MFIV uses the observed option quotes directly. SSVI gives a global parametric, static-arbitrage-aware "
-        "surface; eSSVI lets correlation vary with maturity; Fengler smooths in option-price space under "
-        "convexity/monotonicity/calendar constraints. VolForge integrates "
-        "each model over the **same observed strike support** so differences reflect smoothing/model quality rather than a different wing domain."
+        "The primary VRP path now uses raw-strip MFIV and model-light delta features. SVI/SSVI/eSSVI/Fengler live under "
+        "**Advanced Surface Diagnostics** for smoothing, arbitrage checks, sparse-strike interpolation, and raw-vs-smoothed validation. "
+        "They are useful quality-control tools, but they no longer need to run for ordinary VRP candidate screening."
     )
     st.caption("If a model is flagged unreliable, do not use its smoothed MFIV as confirmation. Treat the disagreement itself as a diagnostic.")
 
@@ -148,75 +147,6 @@ def _fetch_yahoo_intraday(symbol: str, interval: str, period: str) -> pd.DataFra
     if raw.empty:
         raise RuntimeError(f"Yahoo returned no {interval} bars for {symbol}")
     return normalise_intraday_bars(raw)
-
-
-def _surface_focus_dte_range(
-    chain: pd.DataFrame,
-    *,
-    target_days: float,
-    user_range: tuple[float, float],
-) -> tuple[float, float]:
-    """Return a tight expiry window around the target tenor.
-
-    Surface confirmation only needs enough maturities to bracket the target and
-    identify the local term structure.  Restricting the fit to nearby expiries
-    avoids recalibrating the whole 7--180d surface for a 30d diagnostic.
-    """
-    lo, hi = map(float, user_range)
-    dtes = pd.to_numeric(chain.get("dte"), errors="coerce")
-    dtes = np.array(sorted(set(float(x) for x in dtes.dropna() if lo <= float(x) <= hi)))
-    if len(dtes) <= 5:
-        return lo, hi
-
-    target = float(target_days)
-    below = dtes[dtes < target]
-    above = dtes[dtes > target]
-    exact = dtes[np.isclose(dtes, target, atol=1e-8)]
-
-    chosen: list[float] = []
-    chosen.extend(below[-2:].tolist())
-    chosen.extend(exact[:1].tolist())
-    chosen.extend(above[:2].tolist())
-
-    # SSVI/Fengler need at least three calibratable maturities. Fill from the
-    # nearest expiries if one side of the target is sparse.
-    if len(set(chosen)) < 3:
-        nearest = dtes[np.argsort(np.abs(dtes - target))]
-        for dte in nearest:
-            if float(dte) not in chosen:
-                chosen.append(float(dte))
-            if len(set(chosen)) >= 3:
-                break
-
-    chosen = sorted(set(chosen))
-    if len(chosen) < 3:
-        return lo, hi
-    return max(lo, chosen[0] - 1e-6), min(hi, chosen[-1] + 1e-6)
-
-
-@st.cache_data(show_spinner=False, max_entries=16)
-def _build_surface_comparison_cached(
-    chain: pd.DataFrame,
-    target_days: float,
-    fit_lo: float,
-    fit_hi: float,
-    models: tuple[str, ...],
-    fengler_mode: str,
-    fengler_max_maturities: int,
-    fengler_max_strikes: int,
-    fengler_calendar_grid: int,
-):
-    """Cache expensive surface fits by option-chain snapshot/configuration."""
-    return build_surface_mfiv_comparison(
-        chain,
-        target_days=float(target_days),
-        dte_range=(float(fit_lo), float(fit_hi)),
-        models=models,
-        fengler_mode=fengler_mode,
-        fengler_max_maturities=int(fengler_max_maturities),
-        fengler_max_strikes=(None if int(fengler_max_strikes) <= 0 else int(fengler_max_strikes)),
-        fengler_calendar_grid=int(fengler_calendar_grid),
-    )
 
 
 @st.cache_data(show_spinner=False, max_entries=12)
@@ -292,12 +222,135 @@ def _read_table_from_path(path_text: str) -> pd.DataFrame:
     raise ValueError("local file must be CSV or Parquet")
 
 
-def _render_surface_explorer_page():
-    st.title("VolForge · Surface Explorer")
-    st.caption("Inspect the fitted volatility surface, ATM/MFIV term structures, and individual smile curves from one chain snapshot.")
+@st.cache_data(show_spinner=False, max_entries=8)
+def _walk_forward_model_lab_cached(
+    history: pd.DataFrame,
+    target_days: int,
+    min_train: int,
+    refit_every: int,
+):
+    predictions = walk_forward_forecasts(
+        history,
+        target_days=int(target_days),
+        min_train=int(min_train),
+        refit_every=int(refit_every),
+    )
+    return predictions, forecast_metrics(predictions)
+
+
+def _render_model_lab_page():
+    st.title("VolForge · Model Lab")
+    st.caption(
+        "Forecast future realized variance before adding machine learning. "
+        "Persistence → HAR-style RV → HEAVY-RM are the benchmarks XGBoost will eventually have to beat."
+    )
 
     with st.sidebar:
-        st.header("Surface Explorer")
+        st.header("Model Lab")
+        ml_symbol = st.text_input("Symbol", "SPY", key="model_lab_symbol").strip().upper()
+        ml_provider = st.selectbox("Option provider", available_providers(), key="model_lab_provider")
+        ml_target_days = st.number_input("Forecast horizon (days)", 7, 180, 30, step=1, key="model_lab_target")
+        ml_history_path = st.text_input(
+            "VRP history path",
+            f"data/derived/vrp/provider={ml_provider}/symbol={ml_symbol}/history.parquet",
+            key="model_lab_history_path",
+        )
+        ml_min_train = st.number_input("Minimum labeled training rows", 20, 1000, 80, step=10, key="model_lab_min_train")
+        ml_refit = st.number_input("Refit every N observations", 1, 100, 20, step=1, key="model_lab_refit")
+
+    upload = st.file_uploader("Optional VRP history CSV / Parquet", type=["csv", "parquet", "pq"], key="model_lab_upload")
+    try:
+        if upload is not None:
+            history = _read_table_from_upload(upload)
+        else:
+            history = _read_table_from_path(ml_history_path)
+    except Exception as exc:
+        st.info(
+            "Model Lab needs the derived `history.parquet` produced by **Build / update VRP history**. "
+            f"Current load result: {exc}"
+        )
+        return
+
+    dates = pd.to_datetime(history["date"], errors="coerce") if "date" in history else pd.Series(pd.DatetimeIndex(history.index))
+    labeled = int(pd.to_numeric(history["forward_rv_var"], errors="coerce").notna().sum()) if "forward_rv_var" in history else 0
+    rm_rows = int(pd.to_numeric(history["daily_rm"], errors="coerce").notna().sum()) if "daily_rm" in history else 0
+    c1, c2, c3, c4 = st.columns(4)
+    c1.metric("History rows", f"{len(history):,}")
+    c2.metric("Forward labels", f"{labeled:,}")
+    c3.metric("HEAVY RM rows", f"{rm_rows:,}")
+    c4.metric("Through", dates.dropna().max().strftime("%Y-%m-%d") if dates.notna().any() else "—")
+
+    st.subheader("Latest forward-RV forecasts")
+    try:
+        latest = latest_model_forecasts(history, target_days=float(ml_target_days))
+    except Exception as exc:
+        st.warning(f"Could not produce latest forecasts: {exc}")
+        latest = pd.DataFrame()
+
+    if latest.empty:
+        st.info("No benchmark forecast is available yet. Persistence needs trailing RV; HAR needs labeled history; HEAVY-RM needs at least 30 daily realized-measure rows.")
+    else:
+        display = latest.copy()
+        display["forecast_rv_vol_pct"] = 100 * display["forecast_rv_vol"]
+        display["mfiv_vol_pct"] = 100 * np.sqrt(display["mfiv_var"].clip(lower=0.0))
+        display["vol_spread_pct"] = display["mfiv_vol_pct"] - display["forecast_rv_vol_pct"]
+        display["expected_vrp_var_pts"] = 100 * display["expected_vrp"]
+        st.dataframe(
+            display[["model", "forecast_rv_vol_pct", "mfiv_vol_pct", "vol_spread_pct", "expected_vrp_var_pts", "detail"]].round(3),
+            use_container_width=True,
+            hide_index=True,
+        )
+        st.caption("Positive expected VRP means current MFIV exceeds that model's forecast of future realized variance. It is a research estimate, not a trade signal.")
+
+    st.subheader("Walk-forward benchmark")
+    st.write(
+        "HAR training labels are purged so a training row's forward window must end before the test date. "
+        "HEAVY-RM uses only realized measures observable by each forecast date. Lower QLIKE is better."
+    )
+    if labeled < int(ml_min_train) + 5:
+        st.info(
+            f"Need more labeled history before a useful walk-forward comparison. "
+            f"Current labels: {labeled}; configured minimum training rows: {int(ml_min_train)}."
+        )
+        return
+
+    if st.button("Run walk-forward comparison", type="primary", key="model_lab_run"):
+        try:
+            with st.spinner("Running purged expanding-window forecasts…"):
+                predictions, metrics = _walk_forward_model_lab_cached(
+                    history, int(ml_target_days), int(ml_min_train), int(ml_refit)
+                )
+        except Exception as exc:
+            st.error(f"Walk-forward comparison failed: {exc}")
+            return
+        if predictions.empty:
+            st.info("No out-of-sample predictions were produced with the current history and settings.")
+            return
+        st.dataframe(metrics.round(8), use_container_width=True, hide_index=True)
+        chart = predictions.pivot_table(index="date", columns="model", values="forecast_rv_var", aggfunc="last")
+        actual = predictions.drop_duplicates("date").set_index("date")["actual_rv_var"].rename("Actual forward RV")
+        chart = chart.join(actual, how="outer").sort_index()
+        st.line_chart(100 * np.sqrt(chart.clip(lower=0.0)))
+        st.caption("Chart is volatility (%) for readability; scoring is performed in variance units.")
+
+    with st.expander("What each benchmark is doing"):
+        st.markdown(
+            """
+- **Persistence:** assumes the next target-horizon realized variance looks like today's trailing target-horizon realized variance.
+- **HAR 3/9/30:** direct linear forecast using short-, medium-, and monthly realized-variance states already in VRP history.
+- **HEAVY-RM:** models the daily high-frequency realized measure itself, then recursively projects those daily measures over the target horizon.
+
+XGBoost comes after these benchmarks. It must improve genuine out-of-sample forward-RV forecasting, not merely fit the historical sample better.
+"""
+        )
+
+
+def _render_surface_explorer_page():
+    st.title("VolForge · Advanced Surface Diagnostics")
+    st.caption("Optional calibrated-surface diagnostics. The core VRP workflow uses raw MFIV, realized variance, delta ratios, and term structure without requiring SVI-family or Fengler calibration.")
+
+    with st.sidebar:
+        st.header("Advanced Surface Diagnostics")
         sx_symbol = st.text_input("Symbol", "SPY", key="surface_symbol").strip().upper()
         sx_provider = st.selectbox("Provider", available_providers(), key="surface_provider")
         sx_source = st.radio("Chain source", ("Fetch current", "Latest saved snapshot", "Local snapshot path"), key="surface_source")
@@ -513,11 +566,18 @@ def _render_surface_explorer_page():
         st.dataframe(pts.rename(columns={"iv": "iv_pct"}), use_container_width=True, hide_index=True)
 
 
-page = st.sidebar.radio("Page", ("Forward VRP dashboard", "Surface explorer", "How to use"), index=0)
+page = st.sidebar.radio(
+    "Page",
+    ("Forward VRP dashboard", "Model lab", "Advanced surface diagnostics", "How to use"),
+    index=0,
+)
 if page == "How to use":
     _render_demo_page()
     st.stop()
-if page == "Surface explorer":
+if page == "Model lab":
+    _render_model_lab_page()
+    st.stop()
+if page == "Advanced surface diagnostics":
     _render_surface_explorer_page()
     st.stop()
 
@@ -589,110 +649,11 @@ except Exception as exc:
         st.caption("ORATS requires ORATS_API_TOKEN in the environment and the appropriate data entitlement.")
     st.stop()
 
-local_fit_lo, local_fit_hi = _surface_focus_dte_range(
-    chain,
-    target_days=float(target_days),
-    user_range=(float(dte_lo), float(dte_hi)),
-)
-
-with st.sidebar:
-    st.divider()
-    st.header("Surface confirmation")
-    st.caption(
-        "Optional and expensive. Raw-strip MFIV remains the fast default; "
-        "SSVI/eSSVI/Fengler only run when you ask for confirmation."
-    )
-    confirmation_models = tuple(st.multiselect(
-        "Models",
-        ("SSVI", "eSSVI", "Fengler"),
-        default=("SSVI", "eSSVI"),
-        help="Fengler is opt-in because it is the most expensive real-chain confirmation.",
-    ))
-    fengler_scope = "Fast"
-    if "Fengler" in confirmation_models:
-        fengler_scope = st.selectbox(
-            "Fengler scope",
-            ("Fast", "Expanded", "Full research"),
-            index=0,
-            help=(
-                "Fast: ~5 maturities × 60 strikes near target tenor. Expanded: ~9 maturities × 90 strikes "
-                "across the selected DTE range. Full research: all cleaned maturities/strikes; can take much longer."
-            ),
-        )
-
-    if fengler_scope == "Fast":
-        fit_lo, fit_hi = local_fit_lo, local_fit_hi
-        fengler_mode = "fast"
-        fengler_max_maturities, fengler_max_strikes, fengler_calendar_grid = 5, 60, 61
-    elif fengler_scope == "Expanded":
-        fit_lo, fit_hi = float(dte_lo), float(dte_hi)
-        fengler_mode = "expanded"
-        fengler_max_maturities, fengler_max_strikes, fengler_calendar_grid = 9, 90, 101
-    else:
-        fit_lo, fit_hi = float(dte_lo), float(dte_hi)
-        fengler_mode = "full"
-        fengler_max_maturities, fengler_max_strikes, fengler_calendar_grid = 999, 0, 181
-
-    surface_key = (
-        str(symbol), str(provider), str(snapshot.quote_time), float(target_days),
-        float(fit_lo), float(fit_hi), str(price_side), tuple(confirmation_models),
-        str(fengler_mode), int(fengler_max_maturities), int(fengler_max_strikes),
-        int(fengler_calendar_grid),
-    )
-    confirmations = st.session_state.setdefault("surface_confirmations", {})
-    surface_results = confirmations.get(surface_key, {})
-
-    run_surface_confirmation = st.button(
-        "Run selected confirmation",
-        use_container_width=True,
-        disabled=not confirmation_models,
-        help="Runs only the selected models and caches the result for this exact chain snapshot/configuration.",
-    )
-    if run_surface_confirmation:
-        try:
-            model_text = " + ".join(confirmation_models)
-            with st.spinner(f"Fitting {model_text} once for this chain snapshot…"):
-                surface_results = _build_surface_comparison_cached(
-                    chain, float(target_days), float(fit_lo), float(fit_hi),
-                    tuple(confirmation_models), str(fengler_mode),
-                    int(fengler_max_maturities), int(fengler_max_strikes), int(fengler_calendar_grid),
-                )
-            confirmations[surface_key] = surface_results
-            st.session_state["surface_confirmations"] = confirmations
-        except Exception as exc:
-            st.warning(f"Surface confirmation failed: {exc}")
-            surface_results = {}
-
-    if surface_results:
-        scope_note = f" · Fengler {fengler_scope.lower()}" if "Fengler" in confirmation_models else ""
-        st.success(f"Cached confirmation: {fit_lo:.1f}–{fit_hi:.1f} DTE{scope_note}")
-        source_options = ["Raw strip"] + [name for name in ("SSVI", "eSSVI", "Fengler") if name in surface_results]
-    else:
-        st.caption(
-            f"Not run for this configuration. Planned fit window: {fit_lo:.1f}–{fit_hi:.1f} DTE."
-        )
-        source_options = ["Raw strip"]
-
-    if st.session_state.get("mfiv_source") not in source_options:
-        st.session_state["mfiv_source"] = "Raw strip"
-    mfiv_source = st.selectbox(
-        "Headline MFIV source",
-        source_options,
-        key="mfiv_source",
-        help="SSVI/eSSVI/Fengler become selectable only after that model has been run for the current snapshot.",
-    )
-
-selected_name = mfiv_source
+# The primary VRP workflow uses the observable raw option strip. Calibrated
+# SVI/SSVI/eSSVI/Fengler surfaces live under Advanced Surface Diagnostics so
+# they cannot slow down or gate normal candidate screening.
+selected_name = "Raw strip"
 selected_target = snapshot.target_mfiv
-if mfiv_source != "Raw strip":
-    result = surface_results.get(mfiv_source)
-    if result is None:
-        st.warning(f"{mfiv_source} MFIV was unavailable; falling back to the raw strip.")
-        selected_name = "Raw strip"
-    else:
-        selected_target = result.target
-        if not result.reliable:
-            st.warning(f"{mfiv_source} fit is not marked reliable. Use it as a diagnostic, not confirmation.")
 
 selected_vrp_variance = float(selected_target.implied_variance - snapshot.trailing_target_variance)
 selected_vol_spread = float(selected_target.implied_volatility - snapshot.trailing_target_volatility)
@@ -743,8 +704,8 @@ if selected_vrp_variance > 0:
 else:
     st.warning("Selected implied variance is not above trailing integrated realized variance.")
 
-current_tab, surface_tab, history_tab, diagnostics_tab, raw_tab = st.tabs(
-    ["Current snapshot", "Surface models", "History / features", "Diagnostics", "Raw chain"]
+current_tab, history_tab, diagnostics_tab, raw_tab = st.tabs(
+    ["Current snapshot", "History / features", "Diagnostics", "Raw chain"]
 )
 
 with current_tab:
@@ -778,47 +739,6 @@ with current_tab:
     if rv_cols:
         hist_plot = snapshot.realized_history[rv_cols].dropna(how="all") * 100
         st.line_chart(hist_plot)
-
-with surface_tab:
-    st.subheader("Raw strip vs surface-smoothed MFIV")
-    st.write(
-        "SSVI, eSSVI and Fengler are fit to the cleaned current chain, repriced on the same observed strike support, "
-        "and then integrated with the same MFIV formula. This is a diagnostic comparison, not a model vote."
-    )
-    if not surface_results:
-        st.info(
-            "Raw-strip MFIV is the fast default. Choose models and click **Run selected confirmation** in the sidebar only when "
-            "you want SSVI/eSSVI/Fengler as a quality-control check."
-        )
-        st.caption(f"Current confirmation window: {fit_lo:.1f}–{fit_hi:.1f} DTE.")
-    else:
-        rows = [{
-            "model": "Raw strip",
-            "mfiv": snapshot.target_mfiv.implied_volatility,
-            "variance": snapshot.target_mfiv.implied_variance,
-            "reliable": True,
-            "rmse_iv": np.nan,
-            "detail": f"{price_side} observed quotes",
-        }]
-        for name, result in surface_results.items():
-            rows.append({
-                "model": name, "mfiv": result.target.implied_volatility,
-                "variance": result.target.implied_variance, "reliable": result.reliable,
-                "rmse_iv": result.rmse_iv, "detail": result.detail,
-            })
-        comp = pd.DataFrame(rows)
-        comp["difference_vs_raw"] = comp["mfiv"] - snapshot.target_mfiv.implied_volatility
-        display_comp = comp.copy()
-        for col in ("mfiv", "difference_vs_raw", "rmse_iv"):
-            display_comp[col] = 100 * display_comp[col]
-        st.dataframe(display_comp, use_container_width=True, hide_index=True)
-
-        plot = pd.DataFrame({"Raw strip": snapshot.mfiv_curve.set_index("dte")["implied_volatility"] * 100})
-        for name, result in surface_results.items():
-            if not result.curve.empty:
-                plot = plot.join(result.curve.set_index("dte")[["implied_volatility"]].rename(columns={"implied_volatility": name}) * 100, how="outer")
-        st.line_chart(plot.sort_index())
-        st.caption("A large Raw-vs-model gap is a reason to inspect chain quality, strike coverage, and model reliability before interpreting VRP.")
 
 with history_tab:
     st.subheader("Daily VRP history")

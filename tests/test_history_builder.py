@@ -72,7 +72,7 @@ def test_history_builder_reads_saved_chains_and_adds_forward_labels(tmp_path, mo
 
     assert len(hist) == 3
     assert {
-        "mfiv_var", "trailing_rv_var", "forward_rv_var", "forward_vrp", "rv_slope_3_30",
+        "mfiv_var", "trailing_rv_var", "daily_rm", "forward_rv_var", "forward_vrp", "rv_slope_3_30",
         "atm_iv", "delta_ratio_25p", "delta_ratio_25c",
         "surface_parallel_shift", "surface_put_skew_change", "surface_downside_convexity_change",
     } <= set(hist.columns)
