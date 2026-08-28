@@ -40,6 +40,7 @@ from volforge.delta_surface import (
     build_delta_surface, constant_tenor_delta_slice, delta_lump_scores,
     delta_ratio_term_structure,
 )
+from volforge.vix_curve import load_vix_curve_history
 
 
 st.set_page_config(page_title="VolForge · Forward VRP", page_icon="〽", layout="wide")
@@ -234,6 +235,11 @@ def _build_delta_surface_cached(
     ratios = delta_ratio_term_structure(surface)
     lumps = delta_lump_scores(surface)
     return surface, target, ratios, lumps
+
+
+@st.cache_data(ttl=1800, show_spinner=False)
+def _load_vix_curve_cached() -> pd.DataFrame:
+    return load_vix_curve_history()
 
 
 @st.cache_data(show_spinner=False, max_entries=12)
@@ -443,6 +449,26 @@ def _render_surface_explorer_page():
             ))
             fig.update_layout(xaxis_title="Delta bucket", yaxis_title="DTE", height=520, margin={"l": 0, "r": 0, "t": 25, "b": 0})
             st.plotly_chart(fig, use_container_width=True)
+
+            if st.checkbox("Show 3D delta surface", value=False, key="surface_explorer_delta_3d"):
+                st.markdown("**3D delta volatility surface**")
+                fig3d = go.Figure(data=[go.Surface(
+                    x=list(shown_delta.columns),
+                    y=[float(x) for x in shown_delta.index],
+                    z=shown_delta.to_numpy(float),
+                    colorbar={"title": "IV (%)"},
+                )])
+                fig3d.update_layout(
+                    scene={
+                        "xaxis_title": "Delta bucket",
+                        "yaxis_title": "DTE",
+                        "zaxis_title": "IV (%)",
+                    },
+                    margin={"l": 0, "r": 0, "t": 25, "b": 0},
+                    height=620,
+                )
+                st.plotly_chart(fig3d, use_container_width=True)
+                st.caption("Same delta-volatility matrix as the heatmap, shown in 3D; no additional surface fit is run.")
         except ImportError:
             st.dataframe(shown_delta.round(2), use_container_width=True)
 
@@ -796,6 +822,38 @@ with surface_tab:
 
 with history_tab:
     st.subheader("Daily VRP history")
+
+    st.markdown("### VIX curve regime")
+    st.caption(
+        "Official Cboe daily closes. Backwardation is VIX3M − VIX < 0. "
+        "The 10-session z-score measures today's spread against the ten strictly prior sessions."
+    )
+    try:
+        vix_curve = _load_vix_curve_cached()
+        latest_curve = vix_curve.iloc[-1]
+        vc1, vc2, vc3, vc4 = st.columns(4)
+        vc1.metric("VIX", f"{latest_curve['VIX']:.2f}")
+        vc2.metric("VIX3M", f"{latest_curve['VIX3M']:.2f}")
+        vc3.metric("VIX3M − VIX", f"{latest_curve['vix3m_minus_vix']:+.2f}")
+        z10 = latest_curve["vix_curve_z_10d"]
+        vc4.metric("Curve z-score · 10d", "—" if pd.isna(z10) else f"{z10:+.2f}")
+
+        if bool(latest_curve["vix_backwardation"]):
+            st.warning("**Backwardation:** VIX is above VIX3M.")
+        else:
+            st.info("**Contango:** VIX3M is at or above VIX.")
+
+        chart_left, chart_right = st.columns(2)
+        with chart_left:
+            st.caption("VIX3M − VIX · last 126 sessions")
+            st.line_chart(vix_curve[["vix3m_minus_vix"]].tail(126))
+        with chart_right:
+            st.caption("Prior-only 10-session z-score · last 126 sessions")
+            st.line_chart(vix_curve[["vix_curve_z_10d"]].tail(126))
+    except Exception as exc:
+        st.caption(f"Cboe VIX curve history unavailable: {exc}")
+
+    st.divider()
     st.write(
         "Build or update the compact research table from saved chain snapshots plus integrated realized variance. "
         "The builder reads local data first; it does not issue hundreds of historical option API calls."
