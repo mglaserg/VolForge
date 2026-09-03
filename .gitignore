@@ -10,6 +10,8 @@ build/
 .ipynb_checkpoints/
 .DS_Store
 .env
+.env.*
+!.env.example
 
 # Market data snapshots: large, regenerable-only-going-forward, and
 # potentially licence-restricted. Back these up outside git.

@@ -30,10 +30,32 @@ __all__ = [
     "latest_model_forecasts",
     "walk_forward_forecasts",
     "forecast_metrics",
+    "XGBForecastFit",
+    "fit_xgboost",
+    "latest_xgboost_forecasts",
+    "walk_forward_xgboost",
+    "xgboost_available",
 ]
 
 
 DEFAULT_HAR_FEATURES = ("rv_var_3", "rv_var_9", "rv_var_30")
+
+# Deliberately explicit, knowable-at-t feature family. No forward-RV/VRP
+# columns are discovered automatically.
+DEFAULT_XGB_FEATURES = (
+    "mfiv_var", "trailing_rv_var", "vrp", "vrp_z", "vrp_percentile",
+    "mfiv_z", "mfiv_percentile", "vol_of_vol",
+    "rv_var_3", "rv_var_9", "rv_var_30", "rv_var_60", "rv_var_180",
+    "rv_slope_3_30", "rv_slope_9_30", "rv_slope_9_60", "rv_slope_30_60",
+    "rv_ratio_3_30", "rv_ratio_9_30", "rv_ratio_9_60", "rv_ratio_30_60",
+    "rv_slope_3_30_delta1", "rv_slope_3_30_recent_peak_10", "rv_cooling_from_recent_shock",
+    "atm_iv", "delta_ratio_10p", "delta_ratio_15p", "delta_ratio_25p",
+    "delta_ratio_25c", "delta_ratio_15c", "delta_ratio_10c",
+    "delta_ratio_10p_z", "delta_ratio_15p_z", "delta_ratio_25p_z",
+    "delta_ratio_25c_z", "delta_ratio_15c_z", "delta_ratio_10c_z",
+    "surface_parallel_shift", "surface_put_skew_change", "surface_call_skew_change",
+    "surface_downside_convexity_change", "surface_upside_convexity_change",
+)
 
 
 def _history_frame(history: pd.DataFrame) -> pd.DataFrame:
@@ -380,3 +402,215 @@ def forecast_metrics(predictions: pd.DataFrame) -> pd.DataFrame:
             "bias": float(np.mean(err)),
         })
     return pd.DataFrame(rows).sort_values("qlike").reset_index(drop=True)
+
+
+@dataclass
+class XGBForecastFit:
+    """Small wrapper around an optional XGBoost forward-variance model."""
+
+    model: object
+    feature_cols: tuple[str, ...]
+    nobs: int
+    quantile: float | None = None
+
+    @property
+    def name(self) -> str:
+        return "XGBoost" if self.quantile is None else f"XGBoost q{int(round(100 * self.quantile))}"
+
+    def predict(self, frame: pd.DataFrame) -> pd.Series:
+        x = _xgb_matrix(frame, self.feature_cols)
+        pred = np.asarray(self.model.predict(x), dtype=float)
+        return pd.Series(np.maximum(pred, 0.0), index=frame.index, name="xgb_forecast")
+
+    def feature_importance(self) -> pd.DataFrame:
+        values = getattr(self.model, "feature_importances_", np.zeros(len(self.feature_cols)))
+        out = pd.DataFrame({"feature": self.feature_cols, "importance": np.asarray(values, dtype=float)})
+        return out.sort_values("importance", ascending=False).reset_index(drop=True)
+
+
+def xgboost_available() -> bool:
+    try:
+        import xgboost  # noqa: F401
+        return True
+    except ImportError:
+        return False
+
+
+def _xgb_feature_cols(frame: pd.DataFrame, feature_cols: tuple[str, ...] | None) -> tuple[str, ...]:
+    requested = feature_cols or DEFAULT_XGB_FEATURES
+    cols = []
+    for col in requested:
+        if col not in frame:
+            continue
+        numeric = pd.to_numeric(frame[col], errors="coerce")
+        if numeric.notna().any():
+            cols.append(col)
+    if not cols:
+        raise ValueError("no usable XGBoost features are present in history")
+    return tuple(cols)
+
+
+def _xgb_matrix(frame: pd.DataFrame, feature_cols: tuple[str, ...]) -> pd.DataFrame:
+    out = pd.DataFrame(index=frame.index)
+    for col in feature_cols:
+        if col not in frame:
+            out[col] = np.nan
+        elif pd.api.types.is_bool_dtype(frame[col]):
+            out[col] = frame[col].astype(float)
+        else:
+            out[col] = pd.to_numeric(frame[col], errors="coerce")
+    return out
+
+
+def fit_xgboost(
+    history: pd.DataFrame,
+    *,
+    target_col: str = "forward_rv_var",
+    feature_cols: tuple[str, ...] | None = None,
+    quantile: float | None = None,
+    min_train: int = 80,
+    random_state: int = 7,
+) -> XGBForecastFit:
+    """Fit a compact XGBoost model to forward realized variance.
+
+    ``quantile`` uses XGBoost's ``reg:quantileerror`` objective. This stays
+    experimental until it beats the benchmark models out of sample.
+    """
+    if not xgboost_available():
+        raise RuntimeError("XGBoost is not installed. Install VolForge with the 'ml' extra.")
+    if quantile is not None and not (0.0 < float(quantile) < 1.0):
+        raise ValueError("quantile must be between 0 and 1")
+    import xgboost as xgb
+
+    frame = _history_frame(history)
+    if target_col not in frame:
+        raise ValueError(f"history needs {target_col}")
+    cols = _xgb_feature_cols(frame, feature_cols)
+    y = pd.to_numeric(frame[target_col], errors="coerce")
+    mask = y.notna() & np.isfinite(y) & (y >= 0.0)
+    train = frame.loc[mask]
+    y_train = y.loc[mask]
+    if len(train) < int(min_train):
+        raise ValueError(f"XGBoost needs at least {int(min_train)} labeled rows; found {len(train)}")
+
+    params = dict(
+        n_estimators=300,
+        max_depth=3,
+        learning_rate=0.035,
+        min_child_weight=8,
+        subsample=0.85,
+        colsample_bytree=0.80,
+        reg_lambda=2.0,
+        reg_alpha=0.0,
+        tree_method="hist",
+        random_state=int(random_state),
+        n_jobs=1,
+    )
+    if quantile is None:
+        model = xgb.XGBRegressor(objective="reg:squarederror", **params)
+    else:
+        model = xgb.XGBRegressor(
+            objective="reg:quantileerror",
+            quantile_alpha=float(quantile),
+            **params,
+        )
+    model.fit(_xgb_matrix(train, cols), y_train.to_numpy(float), verbose=False)
+    return XGBForecastFit(model=model, feature_cols=cols, nobs=int(len(train)), quantile=quantile)
+
+
+def latest_xgboost_forecasts(
+    history: pd.DataFrame,
+    *,
+    min_train: int = 80,
+    quantiles: tuple[float, ...] = (0.70,),
+    feature_cols: tuple[str, ...] | None = None,
+) -> tuple[pd.DataFrame, pd.DataFrame]:
+    """Return latest mean/quantile XGBoost forecasts plus mean-model importance."""
+    frame = _history_frame(history)
+    if frame.empty or "mfiv_var" not in frame:
+        raise ValueError("history needs rows and mfiv_var")
+    latest = frame.iloc[[-1]]
+    mfiv = float(pd.to_numeric(latest["mfiv_var"], errors="coerce").iloc[0])
+    fits = [fit_xgboost(frame, min_train=min_train, feature_cols=feature_cols)]
+    for q in quantiles:
+        fits.append(fit_xgboost(frame, min_train=min_train, feature_cols=feature_cols, quantile=float(q)))
+    rows = []
+    for fit in fits:
+        pred = float(fit.predict(latest).iloc[0])
+        rows.append({
+            "model": fit.name,
+            "forecast_rv_var": pred,
+            "forecast_rv_vol": float(np.sqrt(max(pred, 0.0))),
+            "mfiv_var": mfiv,
+            "expected_vrp": mfiv - pred,
+            "detail": f"{fit.nobs} labeled rows · {len(fit.feature_cols)} features",
+        })
+    return pd.DataFrame(rows), fits[0].feature_importance()
+
+
+def walk_forward_xgboost(
+    history: pd.DataFrame,
+    *,
+    target_days: int = 30,
+    min_train: int = 80,
+    refit_every: int = 20,
+    quantiles: tuple[float, ...] = (0.70,),
+    feature_cols: tuple[str, ...] | None = None,
+) -> pd.DataFrame:
+    """Purged expanding-window XGBoost evaluation.
+
+    Training rows are eligible only when their entire forward label window ends
+    before the forecast date, matching the HAR purge rule.
+    """
+    frame = _history_frame(history)
+    if "forward_rv_var" not in frame:
+        raise ValueError("history needs forward_rv_var")
+    target = pd.to_numeric(frame["forward_rv_var"], errors="coerce")
+    predictions: list[dict] = []
+    fits: list[XGBForecastFit] | None = None
+    last_train_count = -1
+
+    for i, row in frame.iterrows():
+        y = float(target.iloc[i]) if np.isfinite(target.iloc[i]) else np.nan
+        if not np.isfinite(y):
+            continue
+        forecast_date = pd.Timestamp(row["date"])
+        purge_cutoff = forecast_date - pd.Timedelta(days=int(target_days))
+        train = frame[
+            (frame["date"] < purge_cutoff)
+            & pd.to_numeric(frame["forward_rv_var"], errors="coerce").notna()
+        ]
+        if len(train) < int(min_train):
+            continue
+        if fits is None or len(train) - last_train_count >= int(refit_every):
+            try:
+                fits = [fit_xgboost(train, min_train=min_train, feature_cols=feature_cols)]
+                for q in quantiles:
+                    fits.append(
+                        fit_xgboost(
+                            train,
+                            min_train=min_train,
+                            feature_cols=feature_cols,
+                            quantile=float(q),
+                        )
+                    )
+                last_train_count = len(train)
+            except (ValueError, RuntimeError):
+                fits = None
+        if not fits:
+            continue
+        current = pd.DataFrame([row])
+        for fit in fits:
+            pred = float(fit.predict(current).iloc[0])
+            if np.isfinite(pred):
+                predictions.append({
+                    "date": forecast_date,
+                    "model": fit.name,
+                    "forecast_rv_var": pred,
+                    "actual_rv_var": y,
+                })
+    out = pd.DataFrame(predictions)
+    if out.empty:
+        return out
+    out["error"] = out["forecast_rv_var"] - out["actual_rv_var"]
+    return out.sort_values(["date", "model"]).reset_index(drop=True)

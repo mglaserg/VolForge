@@ -30,3 +30,17 @@ def test_trading_window_annualization():
     s = pd.Series(1e-4, index=idx)
     rv = rolling_integrated_variance(s, 5, basis="trading")
     assert np.isclose(rv.iloc[-1], 1e-4 * 252)
+
+
+def test_regular_session_bars_filters_extended_hours():
+    from volforge.realized import regular_session_bars
+
+    bars = pd.DataFrame({
+        "timestamp": pd.to_datetime([
+            "2026-08-25 12:00Z", "2026-08-25 13:30Z", "2026-08-25 19:55Z", "2026-08-25 22:00Z"
+        ], utc=True),
+        "close": [99.0, 100.0, 101.0, 102.0],
+    })
+    got = regular_session_bars(bars)
+    assert len(got) == 2
+    assert got["timestamp"].min() == pd.Timestamp("2026-08-25 13:30Z")

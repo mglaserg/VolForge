@@ -15,6 +15,7 @@ import pandas as pd
 __all__ = [
     "IntegratedVarianceSeries",
     "daily_integrated_variance",
+    "regular_session_bars",
     "rolling_integrated_variance",
     "forward_integrated_variance",
     "integrated_volatility",
@@ -35,6 +36,37 @@ class IntegratedVarianceSeries:
 
     def forward(self, horizon: int, *, basis: str = "calendar") -> pd.Series:
         return forward_integrated_variance(self.daily_variance, horizon, basis=basis)
+
+
+def regular_session_bars(
+    bars: pd.DataFrame,
+    *,
+    timestamp_col: str = "timestamp",
+    session_tz: str = "America/New_York",
+    start_time: str = "09:30",
+    end_time: str = "16:00",
+) -> pd.DataFrame:
+    """Filter timestamped bars to the regular US equity session.
+
+    Alpaca historical bars can include observations outside regular hours.
+    VolForge keeps those out of the intraday sum and lets
+    :func:`daily_integrated_variance` add the prior-close/current-open gap once.
+    """
+    if timestamp_col not in bars:
+        raise ValueError(f"bars must contain {timestamp_col!r}")
+    out = bars.copy()
+    ts = pd.to_datetime(out[timestamp_col], errors="coerce", utc=True)
+    valid = ts.notna()
+    out = out.loc[valid].copy()
+    ts = ts.loc[valid]
+    local = ts.dt.tz_convert(session_tz)
+    start = pd.to_datetime(start_time).time()
+    end = pd.to_datetime(end_time).time()
+    clock = local.dt.time
+    mask = clock.ge(start) & clock.le(end)
+    out = out.loc[mask].copy()
+    out[timestamp_col] = ts.loc[mask].to_numpy()
+    return out.sort_values(timestamp_col).reset_index(drop=True)
 
 
 def daily_integrated_variance(

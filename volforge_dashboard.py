@@ -30,17 +30,17 @@ from volforge.data.provider import available_providers, fetch_chain
 from volforge.data.storage import (
     list_chain_snapshots,
     load_chain_snapshot,
-    save_chain_snapshot,
     select_daily_snapshots,
 )
-from volforge.history import VRPHistoryConfig, build_vrp_history, load_daily_variance, save_vrp_history
-from volforge.realized import daily_integrated_variance
 from volforge.delta_surface import (
     build_delta_surface, constant_tenor_delta_slice, delta_lump_scores,
     delta_ratio_term_structure,
 )
 from volforge.vix_curve import load_vix_curve_history
-from volforge.forecasting import latest_model_forecasts, walk_forward_forecasts, forecast_metrics
+from volforge.forecasting import (
+    latest_model_forecasts, walk_forward_forecasts, forecast_metrics,
+    latest_xgboost_forecasts, walk_forward_xgboost, xgboost_available,
+)
 
 
 st.set_page_config(page_title="VolForge · Forward VRP", page_icon="〽", layout="wide")
@@ -238,11 +238,28 @@ def _walk_forward_model_lab_cached(
     return predictions, forecast_metrics(predictions)
 
 
+@st.cache_data(show_spinner=False, max_entries=6)
+def _walk_forward_xgb_cached(
+    history: pd.DataFrame,
+    target_days: int,
+    min_train: int,
+    refit_every: int,
+):
+    predictions = walk_forward_xgboost(
+        history,
+        target_days=int(target_days),
+        min_train=int(min_train),
+        refit_every=int(refit_every),
+        quantiles=(0.70,),
+    )
+    return predictions, forecast_metrics(predictions)
+
+
 def _render_model_lab_page():
     st.title("VolForge · Model Lab")
     st.caption(
-        "Forecast future realized variance before adding machine learning. "
-        "Persistence → HAR-style RV → HEAVY-RM are the benchmarks XGBoost will eventually have to beat."
+        "Forward realized-variance forecasting. Persistence → HAR → HEAVY are the benchmark hurdle; "
+        "XGBoost and q70 XGBoost stay experimental until they beat that hurdle out of sample."
     )
 
     with st.sidebar:
@@ -260,13 +277,10 @@ def _render_model_lab_page():
 
     upload = st.file_uploader("Optional VRP history CSV / Parquet", type=["csv", "parquet", "pq"], key="model_lab_upload")
     try:
-        if upload is not None:
-            history = _read_table_from_upload(upload)
-        else:
-            history = _read_table_from_path(ml_history_path)
+        history = _read_table_from_upload(upload) if upload is not None else _read_table_from_path(ml_history_path)
     except Exception as exc:
         st.info(
-            "Model Lab needs the derived `history.parquet` produced by **Build / update VRP history**. "
+            "Model Lab reads the derived history built by `scripts/build_vrp_history.py`. "
             f"Current load result: {exc}"
         )
         return
@@ -280,67 +294,103 @@ def _render_model_lab_page():
     c3.metric("HEAVY RM rows", f"{rm_rows:,}")
     c4.metric("Through", dates.dropna().max().strftime("%Y-%m-%d") if dates.notna().any() else "—")
 
-    st.subheader("Latest forward-RV forecasts")
+    st.subheader("Latest benchmark forecasts")
     try:
         latest = latest_model_forecasts(history, target_days=float(ml_target_days))
     except Exception as exc:
-        st.warning(f"Could not produce latest forecasts: {exc}")
+        st.warning(f"Could not produce benchmark forecasts: {exc}")
         latest = pd.DataFrame()
-
     if latest.empty:
-        st.info("No benchmark forecast is available yet. Persistence needs trailing RV; HAR needs labeled history; HEAVY-RM needs at least 30 daily realized-measure rows.")
+        st.info("Persistence needs trailing RV; HAR needs labeled history; HEAVY-RM needs at least 30 daily realized-measure rows.")
     else:
         display = latest.copy()
         display["forecast_rv_vol_pct"] = 100 * display["forecast_rv_vol"]
         display["mfiv_vol_pct"] = 100 * np.sqrt(display["mfiv_var"].clip(lower=0.0))
         display["vol_spread_pct"] = display["mfiv_vol_pct"] - display["forecast_rv_vol_pct"]
-        display["expected_vrp_var_pts"] = 100 * display["expected_vrp"]
         st.dataframe(
-            display[["model", "forecast_rv_vol_pct", "mfiv_vol_pct", "vol_spread_pct", "expected_vrp_var_pts", "detail"]].round(3),
+            display[["model", "forecast_rv_vol_pct", "mfiv_vol_pct", "vol_spread_pct", "detail"]].round(3),
             use_container_width=True,
             hide_index=True,
         )
-        st.caption("Positive expected VRP means current MFIV exceeds that model's forecast of future realized variance. It is a research estimate, not a trade signal.")
 
-    st.subheader("Walk-forward benchmark")
-    st.write(
-        "HAR training labels are purged so a training row's forward window must end before the test date. "
-        "HEAVY-RM uses only realized measures observable by each forecast date. Lower QLIKE is better."
-    )
+    st.subheader("Experimental ML")
+    if not xgboost_available():
+        st.info("Install the ML extra to enable XGBoost: `pip install -e .[ml]` (or `uv sync --extra ml`).")
+    elif labeled < int(ml_min_train):
+        st.info(f"XGBoost is installed, but it needs at least {int(ml_min_train)} completed forward labels. Current: {labeled}.")
+    else:
+        if st.button("Fit latest XGBoost + q70", key="model_lab_xgb_latest"):
+            try:
+                with st.spinner("Fitting experimental XGBoost models…"):
+                    xgb_latest, importance = latest_xgboost_forecasts(
+                        history, min_train=int(ml_min_train), quantiles=(0.70,)
+                    )
+            except Exception as exc:
+                st.error(f"XGBoost fit failed: {exc}")
+            else:
+                xgb_display = xgb_latest.copy()
+                xgb_display["forecast_rv_vol_pct"] = 100 * xgb_display["forecast_rv_vol"]
+                xgb_display["mfiv_vol_pct"] = 100 * np.sqrt(xgb_display["mfiv_var"].clip(lower=0.0))
+                xgb_display["vol_spread_pct"] = xgb_display["mfiv_vol_pct"] - xgb_display["forecast_rv_vol_pct"]
+                st.dataframe(
+                    xgb_display[["model", "forecast_rv_vol_pct", "mfiv_vol_pct", "vol_spread_pct", "detail"]].round(3),
+                    use_container_width=True,
+                    hide_index=True,
+                )
+                with st.expander("XGBoost feature importance", expanded=False):
+                    st.dataframe(importance.head(20), use_container_width=True, hide_index=True)
+
+    st.subheader("Walk-forward scorecard")
+    st.caption("All supervised models use purged expanding-window labels. Lower QLIKE is better.")
     if labeled < int(ml_min_train) + 5:
         st.info(
-            f"Need more labeled history before a useful walk-forward comparison. "
-            f"Current labels: {labeled}; configured minimum training rows: {int(ml_min_train)}."
+            f"Need more completed labels for useful out-of-sample scoring. "
+            f"Current: {labeled}; minimum training rows: {int(ml_min_train)}."
         )
         return
 
-    if st.button("Run walk-forward comparison", type="primary", key="model_lab_run"):
+    if st.button("Run benchmark walk-forward", type="primary", key="model_lab_run"):
         try:
-            with st.spinner("Running purged expanding-window forecasts…"):
+            with st.spinner("Running purged benchmark forecasts…"):
                 predictions, metrics = _walk_forward_model_lab_cached(
                     history, int(ml_target_days), int(ml_min_train), int(ml_refit)
                 )
         except Exception as exc:
-            st.error(f"Walk-forward comparison failed: {exc}")
-            return
-        if predictions.empty:
-            st.info("No out-of-sample predictions were produced with the current history and settings.")
-            return
-        st.dataframe(metrics.round(8), use_container_width=True, hide_index=True)
-        chart = predictions.pivot_table(index="date", columns="model", values="forecast_rv_var", aggfunc="last")
-        actual = predictions.drop_duplicates("date").set_index("date")["actual_rv_var"].rename("Actual forward RV")
-        chart = chart.join(actual, how="outer").sort_index()
-        st.line_chart(100 * np.sqrt(chart.clip(lower=0.0)))
-        st.caption("Chart is volatility (%) for readability; scoring is performed in variance units.")
+            st.error(f"Benchmark walk-forward failed: {exc}")
+        else:
+            st.dataframe(metrics.round(8), use_container_width=True, hide_index=True)
+            if not predictions.empty:
+                with st.expander("Benchmark forecast chart", expanded=False):
+                    chart = predictions.pivot_table(index="date", columns="model", values="forecast_rv_var", aggfunc="last")
+                    actual = predictions.drop_duplicates("date").set_index("date")["actual_rv_var"].rename("Actual forward RV")
+                    st.line_chart(100 * np.sqrt(chart.join(actual, how="outer").sort_index().clip(lower=0.0)))
 
-    with st.expander("What each benchmark is doing"):
+    if xgboost_available() and st.button("Run XGBoost walk-forward", key="model_lab_xgb_walk"):
+        try:
+            with st.spinner("Running purged XGBoost + q70 forecasts…"):
+                xpred, xmetrics = _walk_forward_xgb_cached(
+                    history, int(ml_target_days), int(ml_min_train), int(ml_refit)
+                )
+        except Exception as exc:
+            st.error(f"XGBoost walk-forward failed: {exc}")
+        else:
+            st.dataframe(xmetrics.round(8), use_container_width=True, hide_index=True)
+            if not xpred.empty:
+                with st.expander("XGBoost forecast chart", expanded=False):
+                    chart = xpred.pivot_table(index="date", columns="model", values="forecast_rv_var", aggfunc="last")
+                    actual = xpred.drop_duplicates("date").set_index("date")["actual_rv_var"].rename("Actual forward RV")
+                    st.line_chart(100 * np.sqrt(chart.join(actual, how="outer").sort_index().clip(lower=0.0)))
+
+    with st.expander("Model rules", expanded=False):
         st.markdown(
             """
-- **Persistence:** assumes the next target-horizon realized variance looks like today's trailing target-horizon realized variance.
-- **HAR 3/9/30:** direct linear forecast using short-, medium-, and monthly realized-variance states already in VRP history.
-- **HEAVY-RM:** models the daily high-frequency realized measure itself, then recursively projects those daily measures over the target horizon.
+- **Persistence:** trailing target-horizon RV.
+- **HAR 3/9/30:** direct linear forecast from realized-variance states.
+- **HEAVY-RM:** high-frequency realized-measure dynamics.
+- **XGBoost:** experimental mean forward-RV forecast.
+- **XGBoost q70:** conservative 70th-percentile forward-RV forecast.
 
-XGBoost comes after these benchmarks. It must improve genuine out-of-sample forward-RV forecasting, not merely fit the historical sample better.
+XGBoost does not graduate to the main dashboard unless its purged out-of-sample score beats the simpler hurdle.
 """
         )
 
@@ -600,22 +650,29 @@ with st.sidebar:
 
     st.divider()
     st.header("Integrated RV")
+    alpaca_default_path = Path(
+        f"data/intraday/provider=alpaca/feed=iex/symbol={symbol}/bars_5min.parquet"
+    )
     bar_source = st.radio(
         "Intraday source",
-        ("Yahoo recent bars (preview)", "Local CSV / Parquet"),
+        ("Local Alpaca/IEX archive", "Yahoo recent bars (preview)", "Local CSV / Parquet"),
+        index=0 if alpaca_default_path.exists() else 1,
     )
     uploaded_bars = None
     local_bar_path = ""
     if bar_source.startswith("Yahoo"):
         bar_interval = st.selectbox("Bar interval", ("5m", "15m"), index=0)
         bar_period = st.selectbox("History", ("60d",), index=0)
-        st.caption("Useful for live diagnostics; not a substitute for research-grade historical HF data.")
+        st.caption("Preview only. The research path is the local Alpaca/IEX archive.")
+    elif bar_source.startswith("Local Alpaca"):
+        local_bar_path = st.text_input(
+            "Alpaca archive path",
+            value=str(alpaca_default_path),
+        )
+        st.caption("Update it with `python scripts/update_intraday.py --symbol SYMBOL`.")
     else:
         uploaded_bars = st.file_uploader("Upload intraday bars", type=["csv", "parquet", "pq"])
-        local_bar_path = st.text_input(
-            "…or local path",
-            value=f"data/intraday/{symbol}.parquet",
-        )
+        local_bar_path = st.text_input("…or local path", value=f"data/intraday/{symbol}.parquet")
         st.caption("Expected: timestamp + close, or a DatetimeIndex + Close column.")
 
     run = st.button("Run / refresh", type="primary", use_container_width=True)
@@ -709,45 +766,43 @@ current_tab, history_tab, diagnostics_tab, raw_tab = st.tabs(
 )
 
 with current_tab:
-    left, right = st.columns(2)
-    with left:
-        st.subheader("Model-free implied-vol term structure")
-        implied_plot = snapshot.mfiv_curve[["dte", "implied_volatility"]].copy()
-        implied_plot["MFIV (%)"] = 100 * implied_plot.pop("implied_volatility")
-        st.line_chart(implied_plot, x="dte", y="MFIV (%)")
+    st.subheader("Volatility term structure")
+    implied = snapshot.mfiv_curve[["dte", "implied_volatility"]].copy()
+    implied["days"] = implied["dte"].round().astype(int)
+    implied = implied.groupby("days", as_index=True)["implied_volatility"].mean().rename("MFIV")
+    if snapshot.realized_curve.empty:
+        curve = implied.to_frame() * 100
+    else:
+        realized = snapshot.realized_curve.set_index("days")["realized_volatility"].rename("Integrated RV")
+        curve = pd.concat([implied, realized], axis=1).sort_index() * 100
+    st.line_chart(curve)
+    with st.expander("Term-structure tables", expanded=False):
         display = snapshot.mfiv_curve.copy()
         display["implied_volatility"] *= 100
         display["implied_variance"] *= 100
         display["parity_r2"] = display["parity_r2"].round(6)
+        st.markdown("**MFIV**")
         st.dataframe(
             display[["expiry", "dte", "implied_volatility", "implied_variance", "forward", "parity_r2", "n_strikes"]],
             use_container_width=True,
             hide_index=True,
         )
-    with right:
-        st.subheader("Integrated realized-vol term structure")
-        if snapshot.realized_curve.empty:
-            st.info("Not enough intraday history for the requested realized-vol windows.")
+        if not snapshot.realized_curve.empty:
+            realized_display = snapshot.realized_curve.copy()
+            realized_display["realized_volatility"] *= 100
+            st.markdown("**Integrated RV**")
+            st.dataframe(realized_display, use_container_width=True, hide_index=True)
+    with st.expander("Realized-vol history", expanded=False):
+        rv_cols = [c for c in ("rv_3", "rv_9", "rv_30", "rv_60", "rv_180") if c in snapshot.realized_history]
+        if rv_cols:
+            st.line_chart(snapshot.realized_history[rv_cols].dropna(how="all") * 100)
         else:
-            realized_plot = snapshot.realized_curve.copy()
-            realized_plot["Integrated RV (%)"] = 100 * realized_plot.pop("realized_volatility")
-            st.line_chart(realized_plot, x="days", y="Integrated RV (%)")
-            st.dataframe(realized_plot, use_container_width=True, hide_index=True)
-
-    st.subheader("Realized-vol history")
-    rv_cols = [c for c in ("rv_3", "rv_9", "rv_30", "rv_60", "rv_180") if c in snapshot.realized_history]
-    if rv_cols:
-        hist_plot = snapshot.realized_history[rv_cols].dropna(how="all") * 100
-        st.line_chart(hist_plot)
+            st.caption("Not enough realized history yet.")
 
 with history_tab:
     st.subheader("Daily VRP history")
+    st.caption("Read-only here. Update data with the scripts; the dashboard reads the finished research table.")
 
-    st.markdown("### VIX curve regime")
-    st.caption(
-        "Official Cboe daily closes. Backwardation is VIX3M − VIX < 0. "
-        "The 10-session z-score measures today's spread against the ten strictly prior sessions."
-    )
     try:
         vix_curve = _load_vix_curve_cached()
         latest_curve = vix_curve.iloc[-1]
@@ -757,198 +812,86 @@ with history_tab:
         vc3.metric("VIX3M − VIX", f"{latest_curve['vix3m_minus_vix']:+.2f}")
         z10 = latest_curve["vix_curve_z_10d"]
         vc4.metric("Curve z-score · 10d", "—" if pd.isna(z10) else f"{z10:+.2f}")
-
-        if bool(latest_curve["vix_backwardation"]):
-            st.warning("**Backwardation:** VIX is above VIX3M.")
-        else:
-            st.info("**Contango:** VIX3M is at or above VIX.")
-
-        chart_left, chart_right = st.columns(2)
-        with chart_left:
-            st.caption("VIX3M − VIX · last 126 sessions")
+        with st.expander("VIX curve charts", expanded=False):
+            st.caption("VIX3M − VIX")
             st.line_chart(vix_curve[["vix3m_minus_vix"]].tail(126))
-        with chart_right:
-            st.caption("Prior-only 10-session z-score · last 126 sessions")
+            st.caption("Prior-only 10-session z-score")
             st.line_chart(vix_curve[["vix_curve_z_10d"]].tail(126))
     except Exception as exc:
         st.caption(f"Cboe VIX curve history unavailable: {exc}")
 
-    st.divider()
-    st.write(
-        "Build or update the compact research table from saved chain snapshots plus integrated realized variance. "
-        "The builder reads local data first; it does not issue hundreds of historical option API calls."
-    )
-
-    with st.expander("Build / update VRP history", expanded=False):
-        st.markdown("**1. Archive the current chain (optional)**")
-        hist_chain_root = st.text_input("Chain archive root", "data/chains", key="history_chain_root")
-        save_col, saved_info = st.columns([1, 2])
-        with save_col:
-            if st.button("Save current chain", use_container_width=True, key="history_save_chain"):
-                try:
-                    ref = save_chain_snapshot(chain, provider=provider, root=hist_chain_root)
-                    st.session_state["history_saved_chain"] = str(ref.path)
-                except Exception as exc:
-                    st.error(f"Could not save chain: {exc}")
-        with saved_info:
-            if st.session_state.get("history_saved_chain"):
-                st.success(f"Saved: {st.session_state['history_saved_chain']}")
-            else:
-                st.caption("The history builder only uses chain snapshots already saved under the archive root.")
-
-        st.markdown("**2. Choose realized-variance history**")
-        history_rv_source = st.radio(
-            "RV source",
-            ("Current dashboard bars", "Local intraday bars", "Daily integrated variance"),
-            horizontal=True,
-            key="history_rv_source",
+    refs = list_chain_snapshots(symbol, provider=provider, root="data/chains", include_legacy_yahoo=True)
+    history_path = Path(f"data/derived/vrp/provider={provider}/symbol={symbol}/history.parquet")
+    with st.expander("History source and rebuild commands", expanded=False):
+        override = st.text_input("Optional history path override", str(history_path), key=f"history_path_{provider}_{symbol}")
+        history_path = Path(override).expanduser()
+        st.code(
+            f"python scripts/update_intraday.py --symbol {symbol}\n"
+            f"python scripts/build_vrp_history.py --symbol {symbol} --provider {provider}",
+            language="powershell",
         )
-        history_rv_path = ""
-        if history_rv_source == "Local intraday bars":
-            history_rv_path = st.text_input(
-                "Intraday bars path", f"data/intraday/{symbol}.parquet", key="history_bars_path"
-            )
-            st.caption("CSV/Parquet with timestamp + close (or common equivalents).")
-        elif history_rv_source == "Daily integrated variance":
-            history_rv_path = st.text_input(
-                "Daily variance path", f"data/realized/{symbol}.parquet", key="history_daily_var_path"
-            )
-            st.caption("CSV/Parquet with date + integrated_variance.")
-        else:
-            st.caption("Uses the bars already loaded for the live dashboard. Useful for a quick update; long research history should come from your local archive.")
-
-        st.markdown("**3. Build / update**")
-        hc1, hc2, hc3 = st.columns(3)
-        with hc1:
-            history_policy = st.selectbox("Daily snapshot", ("latest", "earliest", "closest"), key="history_snapshot_policy")
-        with hc2:
-            history_target_time = st.text_input("Target time ET", "15:30", key="history_target_time", disabled=history_policy != "closest")
-        with hc3:
-            history_rv_asof = st.selectbox("RV as-of", ("previous_session", "same_session"), key="history_rv_asof")
-        history_output_root = st.text_input("Derived history root", "data/derived/vrp", key="history_output_root")
-
-        if st.button("Build / update VRP history", type="primary", use_container_width=True, key="history_build"):
-            try:
-                with st.spinner("Reading saved chains and rebuilding VRP history…"):
-                    if history_rv_source == "Current dashboard bars":
-                        daily_for_history = daily_integrated_variance(bars)
-                    elif history_rv_source == "Local intraday bars":
-                        hist_bars = normalise_intraday_bars(_read_table_from_path(history_rv_path))
-                        daily_for_history = daily_integrated_variance(hist_bars)
-                    else:
-                        daily_for_history = load_daily_variance(history_rv_path)
-
-                    hcfg = VRPHistoryConfig(
-                        target_days=float(target_days),
-                        price_side=price_side,
-                        rv_asof=history_rv_asof,
-                        snapshot_policy=history_policy,
-                        target_time=(history_target_time if history_policy == "closest" else None),
-                    )
-                    built_history = build_vrp_history(
-                        symbol,
-                        daily_for_history,
-                        provider=provider,
-                        chain_root=hist_chain_root,
-                        config=hcfg,
-                    )
-                    target_path = save_vrp_history(
-                        built_history, symbol=symbol, provider=provider, root=history_output_root
-                    )
-                st.session_state["vrp_history_path"] = str(target_path)
-                st.session_state["vrp_history_build_rows"] = int(len(built_history))
-                st.session_state["vrp_history_build_labels"] = int(built_history.get("forward_rv_var", pd.Series(dtype=float)).notna().sum())
-                st.success(
-                    f"Updated {len(built_history)} rows · "
-                    f"{st.session_state['vrp_history_build_labels']} forward labels · {target_path}"
-                )
-            except Exception as exc:
-                st.error(f"Could not build VRP history: {exc}")
-
-    st.write(
-        "Load the compact derived-history file below. Required columns: `date`, `mfiv_var`, `trailing_rv_var`. "
-        "Optional: `forward_rv_var` for the ex-post forward VRP label."
-    )
-    hist_upload = st.file_uploader("VRP history CSV / Parquet", type=["csv", "parquet", "pq"], key="vrp_history")
-    if "vrp_history_path" not in st.session_state:
-        st.session_state["vrp_history_path"] = f"data/derived/vrp/provider={provider}/symbol={symbol}/history.parquet"
-    hist_path = st.text_input(
-        "…or history path",
-        key="vrp_history_path",
-    )
+        st.caption("The default realized source is Alpaca/IEX. Use --daily-variance or --bars to override it.")
 
     hist_frame = None
     try:
-        if hist_upload is not None:
-            hist_frame = _read_table_from_upload(hist_upload)
-        elif Path(hist_path).expanduser().exists():
-            hist_frame = _read_table_from_path(hist_path)
+        if history_path.exists():
+            hist_frame = _read_table_from_path(str(history_path))
     except Exception as exc:
         st.error(f"Could not load VRP history: {exc}")
 
     if hist_frame is None:
-        st.info("No derived VRP history loaded yet. Run `scripts/build_vrp_history.py` after capturing chains and realized-vol data.")
+        h1, h2 = st.columns(2)
+        h1.metric("Saved chain snapshots", f"{len(refs):,}")
+        h2.metric("History file", "Missing")
+        st.info(
+            "No derived VRP history yet. Run `scripts/update_intraday.py`, then `scripts/build_vrp_history.py`. "
+            "The scripts print coverage and row counts so stale history is visible immediately."
+        )
     else:
         try:
             enriched = prepare_vrp_history(hist_frame)
         except Exception as exc:
             st.error(f"History format error: {exc}")
         else:
-            h1, h2 = st.columns(2)
-            with h1:
-                st.markdown("**MFIV vs trailing integrated RV**")
-                vols = enriched[["mfiv_vol", "trailing_rv_vol"]].rename(
-                    columns={"mfiv_vol": "MFIV", "trailing_rv_vol": "Integrated RV"}
-                ) * 100
-                st.line_chart(vols)
-            with h2:
-                st.markdown("**VRP z-score**")
-                st.line_chart(enriched[["vrp_z"]])
+            latest_hist = enriched.tail(1)
+            h1, h2, h3, h4 = st.columns(4)
+            h1.metric("History rows", f"{len(enriched):,}")
+            h2.metric("Through", enriched.index.max().strftime("%Y-%m-%d"))
+            h3.metric("Latest MFIV", _pct(float(latest_hist["mfiv_vol"].iloc[0])))
+            h4.metric("Latest RV", _pct(float(latest_hist["trailing_rv_vol"].iloc[0])))
+            st.markdown("**MFIV vs trailing integrated RV**")
+            vols = enriched[["mfiv_vol", "trailing_rv_vol"]].rename(
+                columns={"mfiv_vol": "MFIV", "trailing_rv_vol": "Integrated RV"}
+            ) * 100
+            st.line_chart(vols)
 
-            h3, h4 = st.columns(2)
-            with h3:
-                st.markdown("**VRP percentile**")
-                st.line_chart(100 * enriched[["vrp_percentile"]])
-            with h4:
-                st.markdown("**Vol-of-vol**")
-                st.line_chart(enriched[["vol_of_vol"]])
+            with st.expander("More history diagnostics", expanded=False):
+                metric_cols = [c for c in ("vrp_z", "vrp_percentile", "vol_of_vol") if c in enriched]
+                if metric_cols:
+                    st.line_chart(enriched[metric_cols])
+                delta_ratio_cols = [
+                    c for c in (
+                        "delta_ratio_10p", "delta_ratio_15p", "delta_ratio_25p",
+                        "delta_ratio_25c", "delta_ratio_15c", "delta_ratio_10c",
+                    ) if c in enriched
+                ]
+                if delta_ratio_cols:
+                    st.markdown("**Delta ratios**")
+                    st.line_chart(enriched[delta_ratio_cols])
+                decomp_cols = [
+                    c for c in (
+                        "surface_parallel_shift", "surface_put_skew_change", "surface_call_skew_change",
+                        "surface_downside_convexity_change", "surface_upside_convexity_change",
+                    ) if c in enriched
+                ]
+                if decomp_cols:
+                    st.markdown("**Delta-space change decomposition**")
+                    st.line_chart(100 * enriched[decomp_cols])
+                if "forward_vrp" in enriched:
+                    st.markdown("**Ex-post forward VRP label**")
+                    st.line_chart(100 * enriched[["forward_vrp"]])
+                st.dataframe(enriched.tail(100), use_container_width=True)
 
-            delta_ratio_cols = [
-                c for c in (
-                    "delta_ratio_10p", "delta_ratio_15p", "delta_ratio_25p",
-                    "delta_ratio_25c", "delta_ratio_15c", "delta_ratio_10c",
-                ) if c in enriched
-            ]
-            if delta_ratio_cols:
-                st.markdown("### Delta-ratio history")
-                st.line_chart(enriched[delta_ratio_cols])
-                z_cols = [f"{c}_z" for c in delta_ratio_cols if f"{c}_z" in enriched]
-                if z_cols:
-                    st.markdown("**Delta-ratio historical z-scores**")
-                    st.line_chart(enriched[z_cols])
-
-            decomp_cols = [
-                c for c in (
-                    "surface_parallel_shift", "surface_put_skew_change", "surface_call_skew_change",
-                    "surface_downside_convexity_change", "surface_upside_convexity_change",
-                ) if c in enriched
-            ]
-            if decomp_cols:
-                st.markdown("### Delta-surface change decomposition")
-                st.line_chart(100 * enriched[decomp_cols])
-                latest = enriched[decomp_cols].dropna(how="all").tail(1)
-                if not latest.empty:
-                    latest_display = (100 * latest.T).rename(columns={latest.index[0]: "latest_change_vol_pts"})
-                    st.dataframe(latest_display, use_container_width=True)
-                st.caption(
-                    "Observable delta-space decomposition: ATM parallel shift, 25Δ put/call skew changes, and wing convexity changes. "
-                    "This is not presented as an exact Vanna-Volga replication."
-                )
-
-            if "forward_vrp" in enriched:
-                st.markdown("**Ex-post forward VRP label**")
-                st.line_chart(100 * enriched[["forward_vrp"]])
-            st.dataframe(enriched.tail(100), use_container_width=True)
 
 with diagnostics_tab:
     st.subheader("Chain quality")

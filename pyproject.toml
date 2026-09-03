@@ -5,19 +5,21 @@ build-backend = "hatchling.build"
 [project]
 name = "volforge"
 version = "0.4.0"
-description = "Arbitrage-aware volatility surface calibration and relative-value research"
+description = "Volatility-risk-premium measurement, forecasting, and optional surface diagnostics"
 requires-python = ">=3.10"
 dependencies = [
     "numpy>=1.24",
     "scipy>=1.10",
     "pandas>=2.0",
     "yfinance>=1.6.0",
+    "python-dotenv>=1.0",
 ]
 
 [project.optional-dependencies]
 data = ["pyarrow>=14", "duckdb>=0.10"]
 viz = ["matplotlib>=3.7", "plotly>=5.18"]
 dashboard = ["streamlit>=1.30"]
+ml = ["xgboost>=2.0"]
 dev = ["pytest>=7.4", "ruff>=0.4", "jupyter"]
 
 [tool.hatch.build.targets.wheel]

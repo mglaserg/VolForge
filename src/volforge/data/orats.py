@@ -13,13 +13,14 @@ from __future__ import annotations
 
 from io import StringIO
 import json
-import os
 from typing import Callable
 from urllib.parse import urlencode
 from urllib.request import urlopen
 
 import numpy as np
 import pandas as pd
+
+from volforge.config import get_env
 
 from .schema import OPTIONAL_COLUMNS, REQUIRED_COLUMNS, add_derived_columns, expiry_datetime, validate_chain
 
@@ -77,9 +78,12 @@ class ORATSProvider:
             Use ORATS live endpoints. Live access requires the applicable ORATS
             agreements/entitlements. Ignored for historical requests.
         """
-        token = self.token or os.environ.get("ORATS_API_TOKEN")
+        token = self.token or get_env("ORATS_API_TOKEN")
         if not token:
-            raise RuntimeError("ORATS API token missing; set ORATS_API_TOKEN or pass token=...")
+            raise RuntimeError(
+                "ORATS API token missing; add ORATS_API_TOKEN to .env, "
+                "set it in the process environment, or pass token=..."
+            )
 
         params: dict[str, str] = {"token": token, "ticker": symbol.upper()}
         if dte_range is not None and not intraday:

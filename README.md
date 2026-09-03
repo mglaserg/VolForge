@@ -1,31 +1,31 @@
 # VolForge
 
-Arbitrage-aware volatility-surface calibration and relative-value research.
+Volatility-risk-premium measurement, forward realized-volatility forecasting, and optional surface diagnostics.
 
 ## Status
 
-The original raw-SVI research stack is implemented end to end: data ingestion,
-quote cleaning, forward extraction, IV inversion, SVI calibration, arbitrage
-diagnostics, the parameter database, fixed-grid surface construction, features,
-PCA, signal evaluation, and plotting.
+VolForge is now primarily a **volatility-risk-premium (VRP) research and decision tool**.
+The core path is deliberately model-light:
 
-Version 0.4 adds two more measurement layers. **eSSVI** extends SSVI with a
-maturity-dependent correlation function and Hendriks-Martini calendar-arbitrage
-conditions. **Fengler** adds a nonparametric constrained natural cubic smoothing
-spline in call-price space with strike and cross-maturity no-arbitrage constraints.
-All four models write to the same model-tagged fixed grid for comparison.
+`option chains -> raw-strip MFIV -> integrated realized variance -> forward-RV forecasts -> VRP candidates`
 
-Phase 13 (trading research) is deliberately not written. Trade construction
-depends on what the signal tests actually show, and writing it now would mean
-guessing. The gate is in place: run `forward_convergence` on real residuals
-first.
+The calibrated volatility surfaces (SVI, SSVI, eSSVI and Fengler) remain in the
+repository, but they are **optional Advanced Surface Diagnostics** rather than a
+requirement for ordinary VRP history, forecasting or candidate screening. They
+are useful for smoothing, arbitrage diagnostics, sparse-strike interpolation and
+separate surface-relative-value research.
+
+The active forecasting hurdle is Persistence -> HAR -> HEAVY-RM. XGBoost and
+quantile XGBoost are implemented in Model Lab as experimental models and do not
+graduate to the main decision view unless they improve purged out-of-sample
+forecasting.
 
 ## Install
 
 ```bash
 git clone <your-repo> volforge && cd volforge
 python -m venv .venv && source .venv/bin/activate   # Windows: .venv\Scripts\activate
-pip install -e ".[data,viz,dev]"
+pip install -e ".[data,viz,dev,ml]"
 pip install yfinance          # only needed for the Yahoo adapter
 ```
 
@@ -290,16 +290,33 @@ warm-starts from the previous day's `(m, sigma)`.
 
 ## Roadmap
 
-The next surface-infrastructure steps are intentionally separated from alpha
-research:
+The active roadmap is now about data quality, forward realized-volatility
+forecasting and a simple VRP decision screen:
 
-1. SSVI — **implemented**.
-2. Fengler arbitrage-free smoothing surface — **implemented in v0.4**.
-3. Hendriks-Martini eSSVI — **implemented in v0.4**.
-4. Robust eSSVI/SSVI slice calibration and arbitrage-free interpolation.
-5. Minimal static-arbitrage detection and repair before calibration.
-6. Only after the measurement layer is stable: delta/vega-neutral trade
-   construction, turnover, costs, and out-of-sample testing.
+1. **Alpaca intraday archive** — implemented. Free Alpaca/IEX 5-minute history is
+   stored locally with provider/feed tags so later SIP data cannot be mixed in
+   silently.
+2. **Integrated realized variance** — implemented from the retained intraday
+   archive, including the overnight close/open gap.
+3. **Script-owned VRP history** — implemented. The dashboard is a reader;
+   `scripts/build_vrp_history.py` is the canonical rebuild path and prints chain,
+   RV, row and forward-label coverage.
+4. **Persistence / HAR / HEAVY-RM** — implemented as the benchmark forecasting
+   ladder with purged walk-forward evaluation.
+5. **XGBoost + q70 XGBoost** — implemented experimentally in Model Lab. They must
+   beat the simpler models out of sample before being promoted.
+6. **Probability / distribution view** — next: convert the forecast distribution
+   into quantities such as `P(MFIV > future RV)` rather than another chart.
+7. **Simple decision screen** — keep the default dashboard focused on candidate,
+   MFIV, forecast RV, expected VRP, regime and a short explanation.
+8. **Surface-RV falsifier** — separately run the residual-in-half-spreads test on
+   real SPX chains. Calibrated surfaces remain optional unless that experiment
+   earns further research budget.
+9. **Trade construction** — only after the edge estimate is validated: structure,
+   sizing, costs, tail risk and portfolio integration.
+
+SPX is the preferred reference market for strict European-option methodology
+validation; SPY remains useful for workflow and retail implementation testing.
 
 ## Raw SVI runner
 
@@ -331,16 +348,15 @@ are repaired while the repair amount is retained on the `Surface` object.
 
 ## Forward VRP dashboard
 
-VolForge includes a Streamlit measurement dashboard for the Forward VRP work.
-It keeps the live measurement problem separate from the later ML/trade layer:
-current MFIV is compared with trailing integrated realized variance, while the
-true forward-VRP label remains MFIV today minus variance realized strictly in
-the future.
+VolForge includes a Streamlit dashboard, but data-building jobs intentionally
+live in scripts. The dashboard should answer the VRP question quickly rather
+than behave like an ETL console.
 
-Install the dashboard/data extras. Add `viz` for the interactive 3D surface view:
+Install the dashboard/data extras. Add `viz` for optional 3D diagnostics and
+`ml` for experimental XGBoost:
 
 ```bash
-pip install -e ".[dashboard,data,viz]"
+pip install -e ".[dashboard,data,viz,ml]"
 ```
 
 Run it from the repository root:
@@ -349,47 +365,79 @@ Run it from the repository root:
 streamlit run volforge_dashboard.py
 ```
 
-On Windows you can also run:
+On Windows:
 
 ```text
 scripts\run_dashboard.bat
 ```
 
-The dashboard currently provides:
+The default workflow is:
 
-- Yahoo or ORATS option-provider selection through the provider registry;
-- mid-side or bid-side model-free implied variance;
-- constant-tenor MFIV interpolated in total variance;
-- 5/15-minute integrated realized variance including overnight gaps;
-- current MFIV-versus-trailing-RV comparison and RV 3d/9d/30d/60d/180d term structure;
-- option-chain quality diagnostics and the MFIV expiry-level calculation table;
-- a historical-feature tab that can **save the current chain** and **build/update VRP history directly from the dashboard**, using current bars, a local intraday archive, or a saved daily integrated-variance file;
-- compact `date,mfiv_var,trailing_rv_var` history views, with optional `forward_rv_var`, VRP z-scores, percentiles, vol-of-vol, and the ex-post forward-VRP label without lookahead;
-- RW-style **delta ratios** at 10Δ/15Δ/25Δ puts and calls, historical z-scores/percentiles, local term-structure lump diagnostics, and a transparent ATM/skew/convexity change decomposition;
-- a dedicated **Surface Explorer** page with an interactive 3D fitted surface, ATM and MFIV term structures, a selectable smile/skew curve, a model-light delta-volatility surface, delta-ratio term structure, and raw IV points.
+```bash
+# 1. Update retained 5-minute Alpaca/IEX bars and daily integrated variance.
+python scripts/update_intraday.py --symbol SPY
 
-The built-in Yahoo intraday-bar option is intentionally labeled a **preview**:
-it is convenient for inspecting the live calculations, but the research model
-should ultimately be trained on a retained, research-grade high-frequency data
-history. The history tab also intentionally consumes derived local data rather
-than automatically making hundreds of paid historical option-chain API calls.
+# 2. Capture option chains using the normal capture job / batch file.
 
-### Surface Explorer
+# 3. Rebuild compact VRP history.
+python scripts/build_vrp_history.py --symbol SPY --provider yahoo
 
-Choose **Surface explorer** from the dashboard page selector. The page reuses
-VolForge's production `Surface` objects rather than a separate visualization-only
-interpolation. Select SVI, SSVI, eSSVI, or Fengler and inspect:
+# 4. Open the dashboard; it reads the finished history.
+streamlit run volforge_dashboard.py
+```
 
-- the fitted IV surface across DTE and log-moneyness;
-- the model ATM term structure alongside observed near-ATM points;
-- the raw-strip MFIV term structure;
-- one smile/skew curve at a selected tenor with the nearest observed expiry overlaid;
-- a non-parametric delta surface at 10Δ/15Δ/25Δ put/call buckets plus ATM;
-- delta-ratio term structures and local "lump" residuals; and
-- the raw calibration IV points.
+VolForge loads local credentials from a repository-root `.env` file via
+`python-dotenv`. Copy the committed template once:
 
-Fengler keeps explicit `Fast`, `Expanded`, and `Full research` scopes so opening
-a visualization does not silently launch the most expensive fit.
+```bash
+cp .env.example .env
+```
+
+On Windows PowerShell:
+
+```powershell
+Copy-Item .env.example .env
+```
+
+Then fill in the services you use:
+
+```dotenv
+APCA_API_KEY_ID=your_key
+APCA_API_SECRET_KEY=your_secret
+ORATS_API_TOKEN=
+```
+
+The real `.env` is git-ignored; `.env.example` is safe to commit. Existing
+process environment variables take precedence over `.env`, so CI or scheduled
+jobs can still inject secrets normally.
+
+Alpaca's free research path defaults to the `iex` feed and writes to:
+
+```text
+data/intraday/provider=alpaca/feed=iex/symbol=SPY/bars_5min.parquet
+data/realized/provider=alpaca/feed=iex/symbol=SPY/daily_variance.parquet
+```
+
+This feed separation is intentional. IEX is suitable for building and testing
+the research pipeline; later SIP-quality data can be compared without rewriting
+or contaminating the existing archive.
+
+The dashboard now emphasizes:
+
+- current raw-strip MFIV versus integrated RV;
+- a compact VRP-candidate/regime summary;
+- one primary volatility term-structure chart;
+- one primary MFIV-vs-RV history chart, with secondary diagnostics collapsed;
+- **Model Lab** for Persistence, HAR and HEAVY benchmarks plus experimental
+  XGBoost/q70 XGBoost; and
+- **Advanced Surface Diagnostics** for optional SVI/SSVI/eSSVI/Fengler work.
+
+### Advanced Surface Diagnostics
+
+The calibrated surfaces are deliberately off the core path. Use this page for
+smoothing, static-arbitrage checks, sparse-strike interpolation, raw-vs-smoothed
+MFIV comparisons, or explicitly registered surface-RV research. A visually
+interesting 3D lump is not an alpha result.
 
 ### Delta surface and delta-ratio features
 
@@ -413,18 +461,17 @@ residuals, and daily ATM/skew/convexity change features.
 
 The intended research split is: simple observable features are the primary
 signal inputs; SSVI/eSSVI/Fengler remain smoothing, arbitrage and data-quality
-confirmation tools. A later walk-forward forecasting layer can compare the
-simple feature family against calibrated-surface enrichments out of sample.
+confirmation tools. Model Lab now compares Persistence/HAR/HEAVY with experimental
+XGBoost on purged out-of-sample forward-RV forecasts.
 
-### Build / update VRP history from the dashboard
+### Build / update VRP history from scripts
 
-Open **History / features → Build / update VRP history**. From there you can save
-the chain currently on screen, choose the realized-variance input, and rebuild
-the provider/symbol-partitioned research file. Rerunning the builder later fills
-forward-RV / forward-VRP labels once enough future realized data exists. The UI
-calls the same `volforge.history` functions as the CLI.
+VRP history is intentionally script-owned. `scripts/build_vrp_history.py` reports
+how many option snapshots/dates it found, realized-variance coverage, rows
+written and completed forward labels. This makes stale history a visible data
+problem instead of a silent dashboard state problem.
 
-### VRP regime guide and surface confirmation
+### VRP regime guide
 
 The dashboard now includes a **How to use** page that can be opened without
 fetching market data.  It teaches the intended reading sequence rather than
@@ -437,10 +484,6 @@ have been positive and implied variance must still exceed trailing integrated
 RV.  This captures the cooling-after-shock pattern discussed in the VRP
 research notes.
 
-The sidebar also supports headline MFIV from **Raw strip**, **SSVI**, **eSSVI**, or
-**Fengler**.  SSVI/eSSVI/Fengler values are produced by fitting the current cleaned
-chain, repricing on each expiry's observed strike support, and integrating those
-smoothed option prices with the same model-free variance formula.  The
-**Surface models** tab compares the resulting constant-tenor MFIV values,
-term structures, fit reliability, and model-vs-raw differences.  Large gaps are
-a diagnostic warning, not an automatic signal.
+Headline MFIV on the core dashboard is the raw model-free strip. SVI/SSVI/eSSVI/Fengler
+no longer determine the headline value or gate a VRP candidate; disagreements
+between raw and smoothed surfaces are optional diagnostics.
