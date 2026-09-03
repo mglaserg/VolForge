@@ -27,6 +27,7 @@ from volforge.dashboard import (
     prepare_vrp_history,
 )
 from volforge.data.provider import available_providers, fetch_chain
+from volforge.data.intraday import load_realized_archive, realized_archive_path
 from volforge.data.storage import (
     list_chain_snapshots,
     load_chain_snapshot,
@@ -38,7 +39,7 @@ from volforge.delta_surface import (
 )
 from volforge.vix_curve import load_vix_curve_history
 from volforge.forecasting import (
-    latest_model_forecasts, walk_forward_forecasts, forecast_metrics,
+    latest_realized_model_forecasts, walk_forward_realized_forecasts, forecast_metrics,
     latest_xgboost_forecasts, walk_forward_xgboost, xgboost_available,
 )
 
@@ -224,13 +225,13 @@ def _read_table_from_path(path_text: str) -> pd.DataFrame:
 
 @st.cache_data(show_spinner=False, max_entries=8)
 def _walk_forward_model_lab_cached(
-    history: pd.DataFrame,
+    daily_variance: pd.Series,
     target_days: int,
     min_train: int,
     refit_every: int,
 ):
-    predictions = walk_forward_forecasts(
-        history,
+    predictions = walk_forward_realized_forecasts(
+        daily_variance,
         target_days=int(target_days),
         min_train=int(min_train),
         refit_every=int(refit_every),
@@ -258,73 +259,111 @@ def _walk_forward_xgb_cached(
 def _render_model_lab_page():
     st.title("VolForge · Model Lab")
     st.caption(
-        "Forward realized-variance forecasting. Persistence → HAR → HEAVY are the benchmark hurdle; "
-        "XGBoost and q70 XGBoost stay experimental until they beat that hurdle out of sample."
+        "Realized-volatility forecasting and VRP machine learning are separate datasets. "
+        "HAR/HEAVY use the long Alpaca realized archive; XGBoost uses the scarcer option-chain/VRP history."
     )
 
     with st.sidebar:
         st.header("Model Lab")
         ml_symbol = st.text_input("Symbol", "SPY", key="model_lab_symbol").strip().upper()
-        ml_provider = st.selectbox("Option provider", available_providers(), key="model_lab_provider")
         ml_target_days = st.number_input("Forecast horizon (days)", 7, 180, 30, step=1, key="model_lab_target")
+        ml_rv_provider = st.selectbox("Realized-vol provider", ["alpaca"], key="model_lab_rv_provider")
+        ml_rv_feed = st.selectbox("Realized-vol feed", ["iex", "sip"], key="model_lab_rv_feed")
+        default_rv = realized_archive_path(ml_symbol, provider=ml_rv_provider, feed=ml_rv_feed)
+        ml_realized_path = st.text_input("Realized archive path", str(default_rv), key="model_lab_realized_path")
+        ml_provider = st.selectbox("Option provider (XGBoost only)", available_providers(), key="model_lab_provider")
         ml_history_path = st.text_input(
-            "VRP history path",
+            "VRP history path (XGBoost only)",
             f"data/derived/vrp/provider={ml_provider}/symbol={ml_symbol}/history.parquet",
             key="model_lab_history_path",
         )
-        ml_min_train = st.number_input("Minimum labeled training rows", 20, 1000, 80, step=10, key="model_lab_min_train")
+        ml_min_train = st.number_input("Minimum training rows", 20, 1000, 80, step=10, key="model_lab_min_train")
         ml_refit = st.number_input("Refit every N observations", 1, 100, 20, step=1, key="model_lab_refit")
 
+    st.subheader("Realized-volatility models")
+    st.caption("Persistence, HAR and HEAVY do not require option-chain history or MFIV.")
+    realized_path = Path(ml_realized_path).expanduser()
+    try:
+        daily_rm = load_realized_archive(realized_path)
+    except Exception as exc:
+        st.warning(f"Could not load realized archive: {exc}")
+        daily_rm = pd.Series(dtype="float64", name="integrated_variance")
+
+    if daily_rm.empty:
+        st.info(
+            "No realized archive found. Build it with "
+            f"`python scripts/update_intraday.py --symbol {ml_symbol}`. "
+            "HAR and HEAVY will then use the full Alpaca history, independent of VRP history."
+        )
+    else:
+        c1, c2, c3 = st.columns(3)
+        c1.metric("Realized sessions", f"{len(daily_rm):,}")
+        c2.metric("From", daily_rm.index.min().strftime("%Y-%m-%d"))
+        c3.metric("Through", daily_rm.index.max().strftime("%Y-%m-%d"))
+
+        try:
+            latest = latest_realized_model_forecasts(daily_rm, target_days=int(ml_target_days))
+        except Exception as exc:
+            st.warning(f"Could not produce realized-vol forecasts: {exc}")
+            latest = pd.DataFrame()
+        if latest.empty:
+            st.info("Need enough realized sessions for HAR/HEAVY. HEAVY requires at least 30 daily realized measures.")
+        else:
+            display = latest.copy()
+            display["forecast_rv_vol_pct"] = 100 * display["forecast_rv_vol"]
+            st.dataframe(
+                display[["model", "forecast_rv_vol_pct", "detail"]].round(3),
+                use_container_width=True,
+                hide_index=True,
+            )
+
+        if st.button("Run realized-model walk-forward", type="primary", key="model_lab_run"):
+            try:
+                with st.spinner("Running purged HAR/HEAVY forecasts on the realized archive…"):
+                    predictions, metrics = _walk_forward_model_lab_cached(
+                        daily_rm, int(ml_target_days), int(ml_min_train), int(ml_refit)
+                    )
+            except Exception as exc:
+                st.error(f"Realized-model walk-forward failed: {exc}")
+            else:
+                st.dataframe(metrics.round(8), use_container_width=True, hide_index=True)
+                if not predictions.empty:
+                    with st.expander("Forecast chart", expanded=False):
+                        chart = predictions.pivot_table(index="date", columns="model", values="forecast_rv_var", aggfunc="last")
+                        actual = predictions.drop_duplicates("date").set_index("date")["actual_rv_var"].rename("Actual forward RV")
+                        st.line_chart(100 * np.sqrt(chart.join(actual, how="outer").sort_index().clip(lower=0.0)))
+
+    st.divider()
+    st.subheader("VRP / XGBoost")
+    st.caption(
+        "This section uses option-chain history because MFIV, delta ratios and VRP features only exist on saved chain dates. "
+        "A sparse VRP history does not block HAR or HEAVY above."
+    )
     upload = st.file_uploader("Optional VRP history CSV / Parquet", type=["csv", "parquet", "pq"], key="model_lab_upload")
     try:
         history = _read_table_from_upload(upload) if upload is not None else _read_table_from_path(ml_history_path)
     except Exception as exc:
-        st.info(
-            "Model Lab reads the derived history built by `scripts/build_vrp_history.py`. "
-            f"Current load result: {exc}"
-        )
-        return
+        st.info(f"VRP history not available yet: {exc}")
+        history = pd.DataFrame()
 
-    dates = pd.to_datetime(history["date"], errors="coerce") if "date" in history else pd.Series(pd.DatetimeIndex(history.index))
-    labeled = int(pd.to_numeric(history["forward_rv_var"], errors="coerce").notna().sum()) if "forward_rv_var" in history else 0
-    rm_rows = int(pd.to_numeric(history["daily_rm"], errors="coerce").notna().sum()) if "daily_rm" in history else 0
-    c1, c2, c3, c4 = st.columns(4)
-    c1.metric("History rows", f"{len(history):,}")
-    c2.metric("Forward labels", f"{labeled:,}")
-    c3.metric("HEAVY RM rows", f"{rm_rows:,}")
-    c4.metric("Through", dates.dropna().max().strftime("%Y-%m-%d") if dates.notna().any() else "—")
-
-    st.subheader("Latest benchmark forecasts")
-    try:
-        latest = latest_model_forecasts(history, target_days=float(ml_target_days))
-    except Exception as exc:
-        st.warning(f"Could not produce benchmark forecasts: {exc}")
-        latest = pd.DataFrame()
-    if latest.empty:
-        st.info("Persistence needs trailing RV; HAR needs labeled history; HEAVY-RM needs at least 30 daily realized-measure rows.")
+    if history.empty:
+        st.info("XGBoost will become useful after option-chain/VRP history accumulates. It is not required for HAR/HEAVY.")
     else:
-        display = latest.copy()
-        display["forecast_rv_vol_pct"] = 100 * display["forecast_rv_vol"]
-        display["mfiv_vol_pct"] = 100 * np.sqrt(display["mfiv_var"].clip(lower=0.0))
-        display["vol_spread_pct"] = display["mfiv_vol_pct"] - display["forecast_rv_vol_pct"]
-        st.dataframe(
-            display[["model", "forecast_rv_vol_pct", "mfiv_vol_pct", "vol_spread_pct", "detail"]].round(3),
-            use_container_width=True,
-            hide_index=True,
-        )
+        dates = pd.to_datetime(history["date"], errors="coerce") if "date" in history else pd.Series(pd.DatetimeIndex(history.index))
+        labeled = int(pd.to_numeric(history["forward_rv_var"], errors="coerce").notna().sum()) if "forward_rv_var" in history else 0
+        c1, c2, c3 = st.columns(3)
+        c1.metric("VRP rows", f"{len(history):,}")
+        c2.metric("Forward labels", f"{labeled:,}")
+        c3.metric("Through", dates.dropna().max().strftime("%Y-%m-%d") if dates.notna().any() else "—")
 
-    st.subheader("Experimental ML")
-    if not xgboost_available():
-        st.info("Install the ML extra to enable XGBoost: `pip install -e .[ml]` (or `uv sync --extra ml`).")
-    elif labeled < int(ml_min_train):
-        st.info(f"XGBoost is installed, but it needs at least {int(ml_min_train)} completed forward labels. Current: {labeled}.")
-    else:
-        if st.button("Fit latest XGBoost + q70", key="model_lab_xgb_latest"):
+        if not xgboost_available():
+            st.info("Install the ML extra to enable XGBoost: `pip install -e .[ml]` (or `uv sync --extra ml`).")
+        elif labeled < int(ml_min_train):
+            st.info(f"XGBoost needs labeled VRP history. Current labels: {labeled}; requested minimum: {int(ml_min_train)}.")
+        elif st.button("Fit latest XGBoost + q70", key="model_lab_xgb_latest"):
             try:
-                with st.spinner("Fitting experimental XGBoost models…"):
-                    xgb_latest, importance = latest_xgboost_forecasts(
-                        history, min_train=int(ml_min_train), quantiles=(0.70,)
-                    )
+                with st.spinner("Fitting experimental XGBoost forecasts…"):
+                    xgb_latest, importance = latest_xgboost_forecasts(history, quantiles=(0.70,))
             except Exception as exc:
                 st.error(f"XGBoost fit failed: {exc}")
             else:
@@ -340,57 +379,31 @@ def _render_model_lab_page():
                 with st.expander("XGBoost feature importance", expanded=False):
                     st.dataframe(importance.head(20), use_container_width=True, hide_index=True)
 
-    st.subheader("Walk-forward scorecard")
-    st.caption("All supervised models use purged expanding-window labels. Lower QLIKE is better.")
-    if labeled < int(ml_min_train) + 5:
-        st.info(
-            f"Need more completed labels for useful out-of-sample scoring. "
-            f"Current: {labeled}; minimum training rows: {int(ml_min_train)}."
-        )
-        return
-
-    if st.button("Run benchmark walk-forward", type="primary", key="model_lab_run"):
-        try:
-            with st.spinner("Running purged benchmark forecasts…"):
-                predictions, metrics = _walk_forward_model_lab_cached(
-                    history, int(ml_target_days), int(ml_min_train), int(ml_refit)
-                )
-        except Exception as exc:
-            st.error(f"Benchmark walk-forward failed: {exc}")
-        else:
-            st.dataframe(metrics.round(8), use_container_width=True, hide_index=True)
-            if not predictions.empty:
-                with st.expander("Benchmark forecast chart", expanded=False):
-                    chart = predictions.pivot_table(index="date", columns="model", values="forecast_rv_var", aggfunc="last")
-                    actual = predictions.drop_duplicates("date").set_index("date")["actual_rv_var"].rename("Actual forward RV")
-                    st.line_chart(100 * np.sqrt(chart.join(actual, how="outer").sort_index().clip(lower=0.0)))
-
-    if xgboost_available() and st.button("Run XGBoost walk-forward", key="model_lab_xgb_walk"):
-        try:
-            with st.spinner("Running purged XGBoost + q70 forecasts…"):
-                xpred, xmetrics = _walk_forward_xgb_cached(
-                    history, int(ml_target_days), int(ml_min_train), int(ml_refit)
-                )
-        except Exception as exc:
-            st.error(f"XGBoost walk-forward failed: {exc}")
-        else:
-            st.dataframe(xmetrics.round(8), use_container_width=True, hide_index=True)
-            if not xpred.empty:
-                with st.expander("XGBoost forecast chart", expanded=False):
-                    chart = xpred.pivot_table(index="date", columns="model", values="forecast_rv_var", aggfunc="last")
-                    actual = xpred.drop_duplicates("date").set_index("date")["actual_rv_var"].rename("Actual forward RV")
-                    st.line_chart(100 * np.sqrt(chart.join(actual, how="outer").sort_index().clip(lower=0.0)))
+        if xgboost_available() and labeled >= int(ml_min_train) + 5 and st.button("Run XGBoost walk-forward", key="model_lab_xgb_walk"):
+            try:
+                with st.spinner("Running purged XGBoost + q70 forecasts…"):
+                    xpred, xmetrics = _walk_forward_xgb_cached(
+                        history, int(ml_target_days), int(ml_min_train), int(ml_refit)
+                    )
+            except Exception as exc:
+                st.error(f"XGBoost walk-forward failed: {exc}")
+            else:
+                st.dataframe(xmetrics.round(8), use_container_width=True, hide_index=True)
+                if not xpred.empty:
+                    with st.expander("XGBoost forecast chart", expanded=False):
+                        chart = xpred.pivot_table(index="date", columns="model", values="forecast_rv_var", aggfunc="last")
+                        actual = xpred.drop_duplicates("date").set_index("date")["actual_rv_var"].rename("Actual forward RV")
+                        st.line_chart(100 * np.sqrt(chart.join(actual, how="outer").sort_index().clip(lower=0.0)))
 
     with st.expander("Model rules", expanded=False):
         st.markdown(
             """
-- **Persistence:** trailing target-horizon RV.
-- **HAR 3/9/30:** direct linear forecast from realized-variance states.
-- **HEAVY-RM:** high-frequency realized-measure dynamics.
-- **XGBoost:** experimental mean forward-RV forecast.
-- **XGBoost q70:** conservative 70th-percentile forward-RV forecast.
-
-XGBoost does not graduate to the main dashboard unless its purged out-of-sample score beats the simpler hurdle.
+- **Persistence:** trailing target-horizon realized variance.
+- **HAR 3/9/30:** realized-only direct regression using the long Alpaca archive.
+- **HEAVY-RM:** realized-measure dynamics using the long Alpaca archive.
+- **XGBoost:** experimental VRP model using MFIV/RV/delta/regime features on saved option-chain dates.
+- **q70 XGBoost:** conservative 70th-percentile forward-RV estimate.
+- **Promotion rule:** XGBoost does not become a headline forecast until it beats the realized-vol benchmarks out of sample.
 """
         )
 

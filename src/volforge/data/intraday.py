@@ -15,6 +15,7 @@ __all__ = [
     "realized_archive_path",
     "load_intraday_archive",
     "save_intraday_archive",
+    "load_realized_archive",
     "save_realized_archive",
 ]
 
@@ -93,6 +94,24 @@ def save_intraday_archive(
         incoming = _prepare_bars(pd.concat([prior, incoming], ignore_index=True, sort=False))
     incoming.to_parquet(target, index=False)
     return target
+
+
+
+def load_realized_archive(path: str | Path) -> pd.Series:
+    """Load the canonical daily integrated-variance archive."""
+    target = Path(path)
+    if not target.exists():
+        return pd.Series(dtype="float64", name="integrated_variance")
+    frame = pd.read_parquet(target)
+    if "date" not in frame or "integrated_variance" not in frame:
+        raise ValueError("realized archive needs date and integrated_variance columns")
+    dates = pd.to_datetime(frame["date"], errors="coerce")
+    values = pd.to_numeric(frame["integrated_variance"], errors="coerce")
+    out = pd.Series(values.to_numpy(float), index=pd.DatetimeIndex(dates), name="integrated_variance")
+    out = out[~out.index.isna()].dropna()
+    if out.index.tz is not None:
+        out.index = out.index.tz_localize(None)
+    return out.sort_index().groupby(level=0).last()
 
 
 def save_realized_archive(daily_variance: pd.Series, path: str | Path) -> Path:

@@ -7,6 +7,9 @@ from volforge.forecasting import (
     forecast_metrics,
     latest_model_forecasts,
     walk_forward_forecasts,
+    realized_forecast_frame,
+    latest_realized_model_forecasts,
+    walk_forward_realized_forecasts,
 )
 
 
@@ -84,3 +87,37 @@ def test_walk_forward_is_purged_and_scores_models():
     assert {"model", "n", "mse", "mae", "qlike", "bias"} <= set(metrics.columns)
     assert (metrics["n"] > 0).all()
     assert np.isfinite(metrics["qlike"]).all()
+
+
+def _daily_realized_archive(n=520, seed=19):
+    rng = np.random.default_rng(seed)
+    dates = pd.bdate_range("2024-01-02", periods=n)
+    level = 0.00012 + 0.00004 * np.sin(np.arange(n) / 27.0)
+    rm = np.maximum(level * rng.lognormal(mean=0.0, sigma=0.25, size=n), 1e-8)
+    return pd.Series(rm, index=dates, name="integrated_variance")
+
+
+def test_realized_forecast_frame_is_independent_of_option_history():
+    rm = _daily_realized_archive()
+    frame = realized_forecast_frame(rm, target_days=30)
+    assert len(frame) == len(rm)
+    assert {"daily_rm", "rv_var_3", "rv_var_9", "rv_var_30", "forward_rv_var"} <= set(frame.columns)
+    assert frame["forward_rv_var"].notna().sum() > 300
+    assert frame.tail(10)["forward_rv_var"].isna().all()
+
+
+def test_latest_realized_models_include_har_and_heavy_without_mfiv():
+    rm = _daily_realized_archive()
+    out = latest_realized_model_forecasts(rm, target_days=30)
+    assert {"Persistence", "HAR 3/9/30", "HEAVY-RM"} <= set(out["model"])
+    assert "mfiv_var" not in out.columns
+    assert (out["forecast_rv_var"] >= 0).all()
+
+
+def test_realized_only_walk_forward_scores_har_and_heavy():
+    rm = _daily_realized_archive(620)
+    out = walk_forward_realized_forecasts(rm, target_days=30, min_train=80, refit_every=40)
+    assert not out.empty
+    assert {"Persistence", "HAR 3/9/30", "HEAVY-RM"} <= set(out["model"])
+    metrics = forecast_metrics(out)
+    assert (metrics["n"] > 0).all()

@@ -7,6 +7,7 @@ from volforge.data.intraday import (
     intraday_archive_path,
     load_intraday_archive,
     realized_archive_path,
+    load_realized_archive,
     save_intraday_archive,
     save_realized_archive,
 )
@@ -107,3 +108,6 @@ def test_regular_session_and_realized_archive(tmp_path, monkeypatch):
     loaded = pd.read_parquet(path)
     assert list(loaded.columns) == ["date", "integrated_variance"]
     assert len(loaded) == 2
+    series = load_realized_archive(path)
+    assert len(series) == 2
+    assert series.name == "integrated_variance"

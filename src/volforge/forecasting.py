@@ -20,13 +20,19 @@ import numpy as np
 import pandas as pd
 from scipy.optimize import minimize
 
-from .realized import CALENDAR_DAYS_PER_YEAR, TRADING_DAYS_PER_YEAR
+from .realized import (
+    CALENDAR_DAYS_PER_YEAR, TRADING_DAYS_PER_YEAR,
+    forward_integrated_variance, rolling_integrated_variance,
+)
 
 __all__ = [
     "HARFit",
     "HEAVYRMFit",
     "fit_har",
     "fit_heavy_rm",
+    "realized_forecast_frame",
+    "latest_realized_model_forecasts",
+    "walk_forward_realized_forecasts",
     "latest_model_forecasts",
     "walk_forward_forecasts",
     "forecast_metrics",
@@ -246,6 +252,101 @@ def fit_heavy_rm(realized_measure: pd.Series | np.ndarray) -> HEAVYRMFit:
         success=bool(result.success),
     )
 
+
+
+def realized_forecast_frame(
+    daily_variance: pd.Series,
+    *,
+    target_days: int = 30,
+    har_windows: tuple[int, int, int] = (3, 9, 30),
+) -> pd.DataFrame:
+    """Build a realized-only forecasting table from the daily RM archive.
+
+    This dataset is deliberately independent of option-chain history.  Each row
+    is one realized-measure date and contains trailing HAR state variables plus
+    the ex-post forward target.  It therefore lets HAR and HEAVY use years of
+    intraday history even when MFIV/VRP history is sparse.
+    """
+    rm = pd.Series(daily_variance, dtype="float64", copy=True).dropna()
+    if not isinstance(rm.index, pd.DatetimeIndex):
+        rm.index = pd.to_datetime(rm.index, errors="coerce")
+    rm = rm[~rm.index.isna()].sort_index()
+    if rm.index.tz is not None:
+        rm.index = rm.index.tz_localize(None)
+    rm = rm.groupby(level=0).last()
+    frame = pd.DataFrame({"date": rm.index, "daily_rm": rm.to_numpy(float)})
+    for window in har_windows:
+        frame[f"rv_var_{int(window)}"] = rolling_integrated_variance(rm, int(window), basis="calendar").reindex(rm.index).to_numpy(float)
+    frame["trailing_rv_var"] = rolling_integrated_variance(rm, int(target_days), basis="calendar").reindex(rm.index).to_numpy(float)
+    forward = forward_integrated_variance(rm, int(target_days), basis="calendar").reindex(rm.index)
+    # A forward label is valid only after the complete calendar horizon exists.
+    # The generic realized utility can compute a partial tail window; supervised
+    # forecasting must not treat that incomplete realization as a finished label.
+    complete = rm.index + pd.Timedelta(days=int(target_days)) <= rm.index.max()
+    forward = forward.where(complete)
+    frame["forward_rv_var"] = forward.to_numpy(float)
+    return frame.reset_index(drop=True)
+
+
+def latest_realized_model_forecasts(
+    daily_variance: pd.Series,
+    *,
+    target_days: int = 30,
+    har_features: tuple[str, ...] = DEFAULT_HAR_FEATURES,
+) -> pd.DataFrame:
+    """Latest Persistence/HAR/HEAVY forecasts from realized data alone."""
+    frame = realized_forecast_frame(daily_variance, target_days=int(target_days))
+    if frame.empty:
+        return pd.DataFrame(columns=["model", "forecast_rv_var", "forecast_rv_vol", "detail"])
+    latest = frame.iloc[[-1]]
+    rows: list[dict] = []
+
+    persistence = pd.to_numeric(latest["trailing_rv_var"], errors="coerce").iloc[0]
+    if np.isfinite(persistence):
+        rows.append({"model": "Persistence", "forecast_rv_var": float(persistence), "detail": "Current trailing target-horizon RV"})
+
+    try:
+        har = fit_har(frame, feature_cols=har_features)
+        pred = float(har.predict(latest).iloc[0])
+        rows.append({"model": "HAR 3/9/30", "forecast_rv_var": pred, "detail": f"Realized-only direct OLS · {har.nobs} labeled rows"})
+    except (ValueError, np.linalg.LinAlgError):
+        pass
+
+    try:
+        heavy = fit_heavy_rm(frame["daily_rm"])
+        pred = float(heavy.forecast_horizon_variance(float(target_days)))
+        rows.append({
+            "model": "HEAVY-RM",
+            "forecast_rv_var": pred,
+            "detail": f"Realized archive · α={heavy.alpha:.3f} β={heavy.beta:.3f} · {heavy.nobs} RM rows",
+        })
+    except (ValueError, RuntimeError):
+        pass
+
+    out = pd.DataFrame(rows)
+    if out.empty:
+        return out
+    out["forecast_rv_vol"] = np.sqrt(out["forecast_rv_var"].clip(lower=0.0))
+    return out
+
+
+def walk_forward_realized_forecasts(
+    daily_variance: pd.Series,
+    *,
+    target_days: int = 30,
+    min_train: int = 80,
+    refit_every: int = 20,
+    har_features: tuple[str, ...] = DEFAULT_HAR_FEATURES,
+) -> pd.DataFrame:
+    """Purged walk-forward Persistence/HAR/HEAVY using only realized data."""
+    frame = realized_forecast_frame(daily_variance, target_days=int(target_days))
+    return walk_forward_forecasts(
+        frame,
+        target_days=int(target_days),
+        min_train=int(min_train),
+        refit_every=int(refit_every),
+        har_features=har_features,
+    )
 
 def latest_model_forecasts(
     history: pd.DataFrame,

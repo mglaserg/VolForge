@@ -302,7 +302,9 @@ forecasting and a simple VRP decision screen:
    `scripts/build_vrp_history.py` is the canonical rebuild path and prints chain,
    RV, row and forward-label coverage.
 4. **Persistence / HAR / HEAVY-RM** — implemented as the benchmark forecasting
-   ladder with purged walk-forward evaluation.
+   ladder with purged walk-forward evaluation. These models train directly from
+   the standalone Alpaca daily realized-variance archive; they do **not** require
+   option-chain/VRP history.
 5. **XGBoost + q70 XGBoost** — implemented experimentally in Model Lab. They must
    beat the simpler models out of sample before being promoted.
 6. **Probability / distribution view** — next: convert the forecast distribution
@@ -428,8 +430,9 @@ The dashboard now emphasizes:
 - a compact VRP-candidate/regime summary;
 - one primary volatility term-structure chart;
 - one primary MFIV-vs-RV history chart, with secondary diagnostics collapsed;
-- **Model Lab** for Persistence, HAR and HEAVY benchmarks plus experimental
-  XGBoost/q70 XGBoost; and
+- **Model Lab** for Persistence, HAR and HEAVY benchmarks trained from the long
+  realized-variance archive, plus experimental XGBoost/q70 XGBoost trained from
+  the scarcer option-chain/VRP history; and
 - **Advanced Surface Diagnostics** for optional SVI/SSVI/eSSVI/Fengler work.
 
 ### Advanced Surface Diagnostics
@@ -461,8 +464,9 @@ residuals, and daily ATM/skew/convexity change features.
 
 The intended research split is: simple observable features are the primary
 signal inputs; SSVI/eSSVI/Fengler remain smoothing, arbitrage and data-quality
-confirmation tools. Model Lab now compares Persistence/HAR/HEAVY with experimental
-XGBoost on purged out-of-sample forward-RV forecasts.
+confirmation tools. Model Lab deliberately separates the datasets: Persistence/HAR/HEAVY
+use the standalone realized archive, while experimental XGBoost uses saved-chain VRP
+features. Sparse option history therefore does not block the realized-volatility models.
 
 ### Build / update VRP history from scripts
 
